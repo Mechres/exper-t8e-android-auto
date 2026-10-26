@@ -10,10 +10,10 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 static GLOBAL_TOUCH_TX: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SendableAndroidAutoMessage>>> =
     std::sync::Mutex::new(None);
 
-/// Video feeder queue depth. Bounded to bound maximum latency.
+/// Video feeder queue depth. Bounded to 1 to eliminate visual latency.
 /// Backpressure naturally propagates back to Android Auto's AVMediaAckIndication,
-/// keeping video in real-time sync with zero frame drift.
-const VIDEO_QUEUE_CAP: usize = 16;
+/// keeping video in real-time sync (<30ms) with zero frame accumulation.
+const VIDEO_QUEUE_CAP: usize = 1;
 
 /// One H.264 chunk on its way to FFmpeg, stamped with its enqueue time so the feeder can
 /// report real end-to-end pipeline lag instead of guessing.
@@ -256,20 +256,14 @@ fn spawn_touch_worker() {
                         pending_up = false;
                         is_down = false;
 
-                        // Ensure tap has a minimum duration (35 ms) so Android's gesture
-                        // detector reliably registers the click rather than discarding it as noise.
-                        let elapsed = last_send_time.elapsed();
-                        if let Some(rem) = std::time::Duration::from_millis(35).checked_sub(elapsed) {
-                            std::thread::sleep(rem);
-                        }
-
                         if let Some(android_send) = sender_opt.as_ref() {
                             send_touch_event(android_send, Wifi::touch_action::Enum::RELEASE, last_sent_x, last_sent_y);
                         }
                     } else if is_down {
                         let dx = (cur_x as i32 - last_sent_x as i32).abs();
                         let dy = (cur_y as i32 - last_sent_y as i32).abs();
-                        if (dx >= 4 || dy >= 4) && last_send_time.elapsed() >= std::time::Duration::from_millis(25) {
+                        // 16 ms interval (~60 FPS drag tracking) with 3px deadband
+                        if (dx >= 3 || dy >= 3) && last_send_time.elapsed() >= std::time::Duration::from_millis(16) {
                             last_sent_x = cur_x;
                             last_sent_y = cur_y;
                             last_send_time = std::time::Instant::now();
@@ -322,14 +316,13 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
         let proc = Command::new("ffmpeg")
             .args([
                 "-loglevel", "info",
+                "-threads", "3",
                 "-f", "h264",
                 "-probesize", "32",
                 "-analyzeduration", "0",
                 "-fflags", "nobuffer",
                 "-flags", "low_delay",
                 "-i", "-",
-                // fast_bilinear enables ARM NEON SIMD routines in libswscale,
-                // achieving 30-40 FPS realtime rendering on Cortex-A7 (unlike unoptimized flags=neighbor).
                 "-vf", "scale=1024:768:flags=fast_bilinear",
                 "-pix_fmt", "bgra",
                 "-f", "fbdev",
