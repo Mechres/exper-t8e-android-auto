@@ -141,11 +141,11 @@ fn send_touch_event(
     raw_x: u32,
     raw_y: u32,
 ) {
-    // Physical tablet display is 1024x768.
-    // Android Auto video canvas is 800x480 centered with pad=1024:768:112:144.
-    // Exact 1:1 pixel mapping with zero scaling artifacts and zero distortion:
-    let x = (raw_x as i32 - 112).clamp(0, 799) as u32;
-    let y = (raw_y as i32 - 144).clamp(0, 479) as u32;
+    // Physical tablet display is 1024x768 fullscreen.
+    // Android Auto video canvas is 800x480.
+    // Map raw touch coordinates edge-to-edge across the entire 8-inch screen:
+    let x = ((raw_x as u64 * 800 + 512) / 1024).min(799) as u32;
+    let y = ((raw_y as u64 * 480 + 384) / 768).min(479) as u32;
 
     let mut ev = Wifi::InputEventIndication::new();
     ev.set_timestamp(
@@ -317,17 +317,16 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
         let proc = Command::new("ffmpeg")
             .args([
                 "-loglevel", "info",
-                "-threads", "3",
+                "-threads", "4",
+                "-flags2", "fast",
                 "-f", "h264",
                 "-probesize", "32",
                 "-analyzeduration", "0",
                 "-fflags", "nobuffer",
                 "-flags", "low_delay",
                 "-i", "-",
-                // Native 1:1 pixel rendering centered with black borders (15:9 aspect ratio):
-                // Runs at 56 FPS on Cortex-A7 (vs only 22 FPS with CPU scaling), keeping
-                // the display pipeline completely realtime with zero frame accumulation.
-                "-vf", "pad=1024:768:112:144",
+                // Fullscreen edge-to-edge rendering with fast bilinear NEON scaling:
+                "-vf", "scale=1024:768:flags=fast_bilinear",
                 "-pix_fmt", "bgra",
                 "-f", "fbdev",
                 "/dev/fb0",
