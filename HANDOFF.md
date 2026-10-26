@@ -1,0 +1,193 @@
+# Exper Easypad 8 Wireless Android Auto Head Unit — Engineering Handoff
+
+## 1. Project Overview & Objective
+This project transforms the **Exper Easypad 8 (T8E)**—an Allwinner A31s (sun6i) quad-core Cortex-A7 tablet running Alpine Linux 3.20 on mainline Linux 7.2—into a dedicated in-car **Wireless Android Auto head unit**. 
+
+- **Display:** Fullscreen edge-to-edge rendering on the native 8.0-inch $1024 \times 768$ LCD via Linux SimpleFB (`/dev/fb0`).
+- **Input:** Capacitive multi-touch input via Goodix GT911 polled directly over I2C (`/dev/i2c-0` @ `0x14`).
+- **Audio Output:** Low-latency 48 kHz stereo audio routed through the tablet's 3.5mm analog headphone jack directly into the car stereo AUX port.
+- **Connectivity:** Autonomous in-car Wi-Fi hotspot (`Exper-Auto`) enabling direct TCP-based wireless Android Auto link to the driver's phone.
+
+Repository path: `~/Projeler/exper-t8e-android-auto`
+
+---
+
+## 2. Hardware & Network Topology
+
+```
++--------------------------------------------------------------------------------+
+|                        EXPER EASYPAD 8 (HEAD UNIT)                             |
+|                                                                                |
+|  Allwinner A31s (4x Cortex-A7 @ 1.0 GHz) - 1 GB DDR3 - Alpine Linux 3.20 (7.2) |
+|                                                                                |
+|  +---------------------------+       +--------------------------------------+  |
+|  |   8" LCD (1024x768)       |       |   Goodix GT911 Touchscreen           |  |
+|  |   /dev/fb0 (32-bit BGRA)  |       |   /dev/i2c-0 @ 0x14 (Polled 66 Hz)   |  |
+|  +-------------^-------------+       +------------------v-------------------+  |
+|                |                                        |                      |
+|          FFmpeg Decoder                           exper-auto                   |
+|                |                                        |                      |
+|  +-------------+-------------+       +------------------v-------------------+  |
+|  |   3.5mm Stereo AUX Port   |       |   Wi-Fi Access Point (AP6210/BCM43362)| |
+|  |   aplay 48kHz S16_LE      |<------+   SSID: Exper-Auto                   |  |
+|  +---------------------------+       |   IP: 192.168.43.1/24 (dnsmasq/dhcp) |  |
+|                                      +------------------^-------------------+  |
++---------------------------------------------------------|----------------------+
+                                                          | Wi-Fi (802.11 b/g/n)
+                                                          v
+                                       +--------------------------------------+
+                                       |            DRIVER'S PHONE            |
+                                       |   Android Auto Head Unit Server      |
+                                       |   IP: 192.168.43.40 : Port 5277      |
+                                       +--------------------------------------+
+```
+
+### Network Configuration
+- **Wi-Fi Hotspot (Tablet AP):**
+  - SSID: `Exper-Auto`
+  - WPA2 Passphrase: `experauto2026`
+  - Gateway IP: `192.168.43.1` (netmask `255.255.255.0`)
+  - DHCP Range: `192.168.43.10` – `192.168.43.50` (managed by `dnsmasq`)
+  - Config files: `/etc/exper-auto/hostapd.conf`, `/etc/exper-auto/dnsmasq.conf`
+- **Driver's Phone (Client):**
+  - Static DHCP lease / assigned IP: `192.168.43.40`
+  - Android Auto Head Unit Server Port: `5277` (TCP)
+- **Host PC Debugging Link (USB Gadget):**
+  - Tablet IP: `172.16.42.1` (`usb0`)
+  - Host PC IP: `172.16.42.2`
+  - SSH Access: `sshpass -p exper ssh root@172.16.42.1`
+
+---
+
+## 3. Architecture & Software Stack
+
+### 3.1 Sub-crates in Repository
+- **`src/exper-auto/`**:
+  - The main application binary compiled for `armv7-unknown-linux-musleabihf`.
+  - Implements head unit lifecycle traits: `AndroidAutoMainTrait`, `AndroidAutoVideoChannelTrait`, `AndroidAutoAudioOutputTrait`, `AndroidAutoInputChannelTrait`, and `AndroidAutoSensorTrait`.
+  - Spawns and manages FFmpeg and `aplay` child processes.
+  - Houses the singleton hardware I2C touch poller thread.
+- **`src/android-auto/`**:
+  - Fork of `android-auto` protocol crate with crucial upstream fixes:
+    1. **mTLS 1.2 Handshake:** Configured with a patched `rustls-webpki` to accept Google Automotive Link X.509 v1 client certificates without rejecting on legacy basic constraints.
+    2. **TCP Client Interface (`run_tcp_client`):** Connects outbound to phone port 5277 over TCP.
+    3. **Expanded Multiplexer Queue:** TLS queue `chan` capacity expanded from 256 to 2048 packets to prevent channel deadlock under continuous video/touch streaming.
+    4. **Lifecycle Hooks:** Added `main.connect().await` and `main.disconnect().await` calls inside `handle_client_generic`.
+
+### 3.2 Video Pipeline
+- **Stream Negotiation:** Negotiated to 480p H.264 at 30 fps (`Wifi::video_resolution::Enum::_480p`, `video_fps::Enum::_30`).
+- **Decoder & Renderer:** Spawned child process running FFmpeg directly writing to framebuffer:
+  ```bash
+  ffmpeg -loglevel warning \
+    -f h264 -probesize 32 -analyzeduration 0 \
+    -fflags nobuffer -flags low_delay \
+    -i - \
+    -vf scale=1024:768:flags=neighbor \
+    -pix_fmt bgra \
+    -f fbdev /dev/fb0
+  ```
+- **Concurrency & Non-blocking I/O:**
+  - `receive_video` delivers packets into a dedicated `tokio::sync::mpsc::channel::<Vec<u8>>(512)` via `try_send`.
+  - A separate `spawn_blocking` worker thread drains the channel and writes to FFmpeg's `stdin` with immediate flushing (`let _ = stdin.flush()`).
+  - Scaling is done using `flags=neighbor` (nearest neighbor), reducing CPU consumption by >70% compared to bicubic software scaling.
+
+### 3.3 Audio Pipeline
+- **Channel:** Media audio channel (`AudioChannelType::Media`).
+- **Sink:** Spawned child process feeding ALSA:
+  ```bash
+  aplay -q -D default -r 48000 -f S16_LE -c 2 -
+  ```
+- **Auxiliary Output:** Automatically routes to headphone jack. ALSA mixer master playback volume unmuted and set to 100%.
+
+### 3.4 Touchscreen Input Pipeline
+- **Hardware Controller:** Goodix GT911 at I2C bus 0 address `0x14`.
+- **Driver Model:** Polled continuously via direct userspace I2C ioctl (`I2C_SLAVE`, `0x14` on `/dev/i2c-0`) at 66 Hz (15 ms intervals).
+- **Coordinate Transformation:**
+  - Raw hardware registers swap axes:
+    $$\text{X}_{\text{screen}} = \text{raw\_y} \quad (0 \dots 1024)$$
+    $$\text{Y}_{\text{screen}} = \text{raw\_x} \quad (0 \dots 768)$$
+- **Android Auto MotionEvent Compatibility:**
+  - Protobuf `TouchEvent` must specify:
+    - `touch.set_action_index(0)`
+    - `ev.set_disp_channel(0)`
+    - `InputConfiguration.touchscreen = Some((1024, 768))`
+- **Rate Limiting & Delta Throttling:**
+  - `PRESS` and `RELEASE` are sent immediately without delay.
+  - `DRAG` events are filtered: only transmitted if $\Delta X \ge 4$ or $\Delta Y \ge 4$ pixels AND at least 35 ms has elapsed since the prior event.
+  - Hardware buffer register `0x814E` is cleared (`0x00`) on every cycle to keep the touch IC buffer flowing.
+
+### 3.5 SMP 4-Core CPU Activation
+- **Kernel State:** Allwinner A31s is now operating with **all 4 Cortex-A7 cores active** (`nproc = 4`, `BogoMIPS = 192.00`).
+- **Configuration:**
+  - Removed `nosmp` from `/boot/boot.cmd` and regenerated `/boot/boot.scr`.
+  - Recompiled kernel `zImage` with `CONFIG_CMDLINE_FORCE=n` and `CONFIG_CMDLINE_EXTEND=y`.
+  - Removed `operating-points` from `cpu0` in Device Tree so `cpufreq-dt` exits cleanly (code 19) without crashing during multi-core boot.
+
+---
+
+## 4. Automation & OpenRC Boot Configuration
+
+The tablet is fully autonomous and launches the head unit stack on power-up without requiring a host PC or manual terminal commands:
+
+1. **Screen & Backlight (`/etc/local.d/01-backlight.start`):**
+   Calls `/usr/local/bin/exper-backlight 100` on boot, powering on PG12 LCD logic and PA25/PWM0 backlight.
+2. **Wi-Fi Hotspot (`/etc/local.d/02-wifi-ap.start`):**
+   Calls `/usr/local/bin/wifi-mode ap`, configuring `wlan0` to `192.168.43.1` and starting `hostapd` and `dnsmasq`.
+3. **Head Unit Daemon (`/etc/local.d/03-exper-auto.start`):**
+   Launches `/usr/local/bin/exper-auto >> /var/log/exper-auto.log 2>&1 &`.
+4. **Physical Power Key Toggle (`/usr/local/bin/exper-powerd`):**
+   Listens on AXP221 PEK power key. Short press instantly toggles the screen and backlight off / on.
+
+---
+
+## 5. Build & Deployment Instructions
+
+### Toolchain Requirements
+- Cross-compiler: ARMv7 hard-float musl/glibc toolchain located at:
+  `~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/`
+- Target: `armv7-unknown-linux-musleabihf`
+
+### Compiling `exper-auto`
+```bash
+export CC_armv7_unknown_linux_musleabihf="~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-gcc"
+export AR_armv7_unknown_linux_musleabihf="~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-ar"
+
+cd ~/Projeler/exper-t8e-android-auto/src/exper-auto
+cargo build --release --target armv7-unknown-linux-musleabihf \
+  --config 'target.armv7-unknown-linux-musleabihf.linker="~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-gcc"'
+
+~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-strip \
+  target/armv7-unknown-linux-musleabihf/release/exper-auto
+```
+
+### Deploying to Tablet
+```bash
+sshpass -p exper scp target/armv7-unknown-linux-musleabihf/release/exper-auto root@172.16.42.1:/usr/local/bin/exper-auto
+```
+
+---
+
+## 6. How to Connect & Run in the Vehicle
+
+1. **Power on Tablet:** Connect 5V power to the tablet DC barrel jack or USB OTG port. The tablet will boot Alpine Linux on its MicroSD card.
+2. **Autonomous Startup:** Within ~25 seconds, the LCD backlight turns on, the `Exper-Auto` Wi-Fi hotspot becomes visible, and `exper-auto` enters its connection loop.
+3. **Connect Phone:**
+   - On the driver's phone, connect Wi-Fi to SSID: **`Exper-Auto`** (Password: `experauto2026`).
+   - The phone will obtain IP `192.168.43.40`.
+4. **Start Projection:**
+   - In Android Auto developer settings on the phone, tap **"Start head unit server"**.
+   - `exper-auto` detects port 5277, completes mTLS handshake, and immediately projects Android Auto (Google Maps, Spotify, Navigation) fullscreen on the tablet.
+5. **Audio:** Plug the car's 3.5mm AUX analog cable into the tablet's headphone jack.
+
+---
+
+## 7. Troubleshooting & Diagnostic Cheatsheet
+
+| Symptom | Diagnostic Step | Root Cause & Resolution |
+| :--- | :--- | :--- |
+| **Phone won't connect** | `sshpass -p exper ssh root@172.16.42.1 "nc -zv 192.168.43.40 5277"` | Verify phone is connected to `Exper-Auto` hotspot and Head Unit Server is running in Android Auto developer settings. |
+| **Screen stays black** | `sshpass -p exper ssh root@172.16.42.1 "exper-backlight 100"` | Check if backlight / LCD power (PG12) was turned off by power key daemon. |
+| **Video freezing or lag** | Check `cat /var/log/exper-auto.log` for ping latency | With 4 cores active and `flags=neighbor`, ping latency should stay below 15 ms. If backlog occurs, verify 512-queue is draining. |
+| **Touch unresponsive** | `tail -f /var/log/exper-auto.log \| grep TOUCH` | Check if `[TOUCH] Sent PRESS/DRAG` messages appear. Check `/dev/i2c-0` permissions and I2C address `0x14`. |
+| **Audio silent** | `sshpass -p exper ssh root@172.16.42.1 "amixer set 'Master' 100% unmute"` | Ensure ALSA Master channel is unmuted and headphone cable is fully seated in 3.5mm jack. |
+| **Verify CPU Cores** | `sshpass -p exper ssh root@172.16.42.1 "nproc && cat /sys/devices/system/cpu/online"` | Output must report `4` and `0-3`. If single core, ensure `/boot/boot.scr` and `zImage` were not replaced with `nosmp` builds. |
