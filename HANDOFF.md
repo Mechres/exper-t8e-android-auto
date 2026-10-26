@@ -78,18 +78,26 @@ Repository path: `~/Projeler/exper-t8e-android-auto`
 - **Stream Negotiation:** Negotiated to 480p H.264 at 30 fps (`Wifi::video_resolution::Enum::_480p`, `video_fps::Enum::_30`).
 - **Decoder & Renderer:** Spawned child process running FFmpeg directly writing to framebuffer:
   ```bash
-  ffmpeg -loglevel warning \
+  ffmpeg -loglevel info \
     -f h264 -probesize 32 -analyzeduration 0 \
     -fflags nobuffer -flags low_delay \
     -i - \
-    -vf scale=1024:768:flags=neighbor \
+    -vf scale=1024:768:flags=fast_bilinear \
     -pix_fmt bgra \
     -f fbdev /dev/fb0
   ```
-- **Concurrency & Non-blocking I/O:**
-  - `receive_video` delivers packets into a dedicated `tokio::sync::mpsc::channel::<Vec<u8>>(512)` via `try_send`.
-  - A separate `spawn_blocking` worker thread drains the channel and writes to FFmpeg's `stdin` with immediate flushing (`let _ = stdin.flush()`).
-  - Scaling is done using `flags=neighbor` (nearest neighbor), reducing CPU consumption by >70% compared to bicubic software scaling.
+- **ARM NEON Acceleration (`flags=fast_bilinear`):**
+  - Benchmark findings on Cortex-A7 Allwinner A31s:
+    - Raw H.264 decode (`-f null`): **235 FPS** (7.8x realtime).
+    - `flags=neighbor`: **13-17 FPS** (unoptimized generic C fallback in libswscale, causing 50% frame deficit and massive queue drift).
+    - `flags=fast_bilinear`: **30-40 FPS** (activates hand-optimized ARM NEON assembly in libswscale, achieving full 30 FPS realtime to `/dev/fb0` at 1.0x speed).
+- **Concurrency & Backpressure Flow Control:**
+  - `receive_video` delivers stamped packets (`VideoChunk { data, enq }`) into a `tokio::sync::mpsc::channel` of depth **16** via `tx.send().await`.
+  - Android Auto protocol enforces `max_unacked = 1`: `MediaIndicationAck` is only transmitted back to the phone once `receive_video` has enqueued the chunk into the feeder queue. This naturally paces the phone's encoder to match the tablet's playback rate with zero packet drops.
+- **Latency Diagnostics (`[VIDEO]` stats line, every 2 s while projecting):**
+  ```
+  [VIDEO] in=30.0/s out=30.0/s queue=1/16 lag last=5ms max=18ms ffmpeg=ok cpu0=n/a load=1.40
+  ```
 
 ### 3.3 Audio Pipeline
 - **Channel:** Media audio channel (`AudioChannelType::Media`).
@@ -190,4 +198,29 @@ sshpass -p exper scp target/armv7-unknown-linux-musleabihf/release/exper-auto ro
 | **Video freezing or lag** | Check `cat /var/log/exper-auto.log` for ping latency | With 4 cores active and `flags=neighbor`, ping latency should stay below 15 ms. If backlog occurs, verify 512-queue is draining. |
 | **Touch unresponsive** | `tail -f /var/log/exper-auto.log \| grep TOUCH` | Check if `[TOUCH] Sent PRESS/DRAG` messages appear. Check `/dev/i2c-0` permissions and I2C address `0x14`. |
 | **Audio silent** | `sshpass -p exper ssh root@172.16.42.1 "amixer set 'Master' 100% unmute"` | Ensure ALSA Master channel is unmuted and headphone cable is fully seated in 3.5mm jack. |
+| **Video picture delayed (seconds/minutes behind reality)** | `sshpass -p exper ssh root@172.16.42.1 "grep '\[VIDEO\]' /var/log/exper-auto.log \| tail -20"` | Compare `in=/s` vs `out=/s` and `lag max=`. If `in > out` persistently, FFmpeg cannot decode/scale at 30 fps: check `ffmpeg=`'s `frame=... fps=...` line in the log, `cpu0` frequency (may be stuck low — cpufreq-dt not bound), and `top` for FFmpeg CPU%. The queue is now capped at 64 chunks with keyframe resync, so lag is bounded even when the decoder is slow. |
+| **Video freezes briefly, then jumps to live** | Look for `[VIDEO] Decoder behind ... resyncing at next keyframe` | Expected behavior of the anti-lag policy: the stale backlog is flushed and the stream resyncs at the next SPS/IDR. Frequent occurrences mean FFmpeg is chronically too slow — see the row above. |
+| **Video stalls permanently** | `sshpass -p exper ssh root@172.16.42.1 "grep 'FFmpeg' /var/log/exper-auto.log \| tail"` | `ffmpeg=DEAD` / `FFmpeg stdin write failed` → the decoder crashed; check FFmpeg's own stderr output just above that line in the log. |
 | **Verify CPU Cores** | `sshpass -p exper ssh root@172.16.42.1 "nproc && cat /sys/devices/system/cpu/online"` | Output must report `4` and `0-3`. If single core, ensure `/boot/boot.scr` and `zImage` were not replaced with `nosmp` builds. |
+
+---
+
+## 8. Status & Next Verification Steps
+
+The bounded-lag video feeder (queue depth 64 + IDR/SPS keyframe resynchronization + real-time latency diagnostics) has been **implemented, cross-compiled, and deployed** to the tablet (`/usr/local/bin/exper-auto`, active PID running).
+
+To test and verify video responsiveness:
+
+1. **Connect the phone and start projection:**
+   - Connect phone to Wi-Fi SSID `Exper-Auto`.
+   - In phone's Android Auto developer settings, tap **"Start head unit server"**.
+2. **Watch the live video diagnostics:**
+   ```bash
+   sshpass -p exper ssh root@172.16.42.1 "grep '\[VIDEO\]' /var/log/exper-auto.log | tail -f"
+   ```
+3. **Pass criteria:** `lag max=` stays in the low hundreds of ms during normal playback (previously unbounded, ~60 000 ms and growing).
+4. **If `in` still exceeds `out`** (decoder can't hold 30 fps), check:
+   - FFmpeg's `frame=... fps=...` lines in `/var/log/exper-auto.log`,
+   - `sshpass -p exper ssh root@172.16.42.1 "top -b -n1 | head -15"`,
+   - CPU clock frequency (`cpu0` in stats),
+   - Potential additional decode levers: adding `-flags2 fast` (skip H.264 loop filter/deblocking).
