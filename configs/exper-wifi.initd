@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+description="Exper tablet Wi-Fi client (telefonun hotspot'una baglanir)"
+command="/usr/local/bin/exper-wifi.sh"
+command_background=true
+pidfile="/run/exper-wifi.pid"
+output_log="/var/log/exper-wifi.log"
+error_log="/var/log/exper-wifi.log"
+depend() {
+	need localmount
+	after net.usb0
+}
+stop_post() {
+	killall udhcpc wpa_supplicant 2>/dev/null
+	ip addr flush dev wlan0 2>/dev/null
+}

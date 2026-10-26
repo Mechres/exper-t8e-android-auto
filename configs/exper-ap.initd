@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+description="Exper-Auto Wi-Fi hotspot (hostapd + dnsmasq on wlan0)"
+depend() {
+	need localmount
+	after net.usb0
+}
+start() {
+	ebegin "Starting Exper-Auto hotspot"
+	/usr/local/bin/wifi-mode.sh ap >/var/log/exper-ap.log 2>&1
+	eend $?
+}
+stop() {
+	ebegin "Stopping Exper-Auto hotspot"
+	killall hostapd dnsmasq 2>/dev/null
+	eend 0
+}

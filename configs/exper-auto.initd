@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+description="Exper Easypad 8 wireless Android Auto head unit"
+# Video yerlesimi: fit (1024x614) / full (1024x768 gerilmis) / 1024xH / 4x3 (telefondan 640x480 arayuz iste, 1024x768e buyut)
+export EXPER_VIDEO_LAYOUT=4x3
+command="/usr/local/bin/exper-auto"
+command_background=true
+pidfile="/run/exper-auto.pid"
+output_log="/var/log/exper-auto.log"
+error_log="/var/log/exper-auto.log"
+depend() {
+	need localmount exper-wifi
+	after net.usb0 sshd
+}
+stop_post() {
+	pkill -9 ffmpeg 2>/dev/null || true
+}

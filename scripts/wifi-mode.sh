@@ -19,8 +19,9 @@ case "$1" in
         killall dnsmasq 2>/dev/null || true
         dnsmasq -C /etc/exper-auto/dnsmasq.conf
 
-        # Start HostAPD
+        # Start HostAPD (BCM43362: AP'yi oldurup hemen baslatmak BRCMF_C_UP -512 verir)
         killall hostapd 2>/dev/null || true
+        sleep 2
         hostapd -B /etc/exper-auto/hostapd.conf
 
         echo "Hotspot ACTIVE: SSID 'Exper-Auto', IP 192.168.43.1"

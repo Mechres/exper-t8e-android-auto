@@ -1,6 +1,6 @@
 # Exper Easypad 8 Wireless Android Auto Head Unit — Engineering Handoff
 
-**Date:** 26 October 2026 · **Target Architecture:** Allwinner A31s (`sun6i`, 4× Cortex-A7 @ 1.008 GHz, 1 GB DDR3)  
+**Date:** 27 October 2026 (updated) · **Target Architecture:** Allwinner A31s (`sun6i`, 4× Cortex-A7 @ 1.008 GHz, 1 GB DDR3)  
 **OS:** Alpine Linux 3.20 (Kernel 7.2-rc1) · **Display:** 8.0" 1024×768 LVDS (`/dev/fb0`) · **Touch:** Goodix GT911 (`/dev/input/event0`)  
 **Workspace:** `~/Projeler/exper-t8e-android-auto`  
 **Target Device IP:** `172.16.42.1` (`usb0`) / `192.168.43.1` (`wlan0` AP)
@@ -13,7 +13,7 @@ Transforms the Exper Easypad 8 (Model T8E) into a dedicated in-car **Wireless An
 - **Display Pipeline:** H.264 video decoded via low-latency FFmpeg writing directly to Linux SimpleFB (`/dev/fb0`).
 - **Touch Input:** Native Linux evdev event stream (`/dev/input/event0`, `Goodix Capacitive TouchScreen`), translating gestures into Android Auto `InputEventIndication` (`PRESS`, `RELEASE`, `DRAG`).
 - **Audio Output:** 48 kHz stereo ALSA sink (`aplay`) routed to 3.5mm analog AUX output into car stereo.
-- **Wireless Projection:** Tablet runs standalone autonomous Wi-Fi AP (`Exper-Auto`, `192.168.43.1`). Connects to phone's Android Auto Head Unit Server (port 5277) over mTLS.
+- **Wireless Projection:** Tablet is a Wi-Fi **client of the phone's hotspot** (SSID `<phone hotspot SSID>`, 2.4 GHz) and connects to the phone's Android Auto Head Unit Server (port 5277, phone = default gateway) over mTLS. (The old own-AP design, `Exper-Auto`/`192.168.43.1`, is still available via `exper-ap`/`wifi-mode.sh ap` but is disabled: see section 5b for why.)
 
 ---
 
@@ -93,20 +93,46 @@ Transforms the Exper Easypad 8 (Model T8E) into a dedicated in-car **Wireless An
 - Wrapped in `tokio::time::timeout(Duration::from_millis(1500))`. Retries every 500 ms. Connects within 0.5s of phone server launch.
 - Added dynamic lookup from `/var/lib/misc/dnsmasq.leases` to automatically connect to whatever IP the phone is assigned on Wi-Fi (`192.168.43.x`).
 
-### 3.4 Low-Latency 1:1 Rendering & Touch Alignment
-- **FFmpeg Invocation:**
-  ```bash
-  ffmpeg -loglevel warning -threads 2 -flags2 fast \
-    -fflags nobuffer+flush_packets+discardcorrupt -flags low_delay \
-    -fpsprobesize 0 -probesize 2048 -analyzeduration 0 \
-    -f h264 -framerate 60 -i - \
-    -pix_fmt bgra -xoffset 112 -yoffset 144 -f fbdev /dev/fb0
-  ```
-- **Touch Coordinate Mapping:**
-  $X_{\text{aa}} = \text{clamp}(raw_X - 112, 0, 799)$  
-  $Y_{\text{aa}} = \text{clamp}(raw_Y - 144, 0, 479)$
+### 3.4 Video Pipeline: FFmpeg (decode) -> `drm-show` (NEON scale) -> DRM overlay plane
 
----
+fbdev/swscale path was dropped. Now the kernel runs **sun4i-drm** (DRM KMS) and:
+
+```
+phone H.264 --(exper-auto)--> ffmpeg -pix_fmt yuv420p -f rawvideo - | drm-show --fmt yuv420p --src 800x480 --dst 0,77,1024,614
+```
+- `src/drm-show/` (Rust + `src/yuv_neon.c`): reads raw yuv420p frames, bilinear-scales 800x480 -> dst rect and converts to XRGB with ARMv7 NEON
+  (horizontal ratio is exactly 25:32, so `vtbl4` gathers 8 pixels at once), two threads, writes into DRM dumb buffers and
+  flips an **overlay plane** from a separate flip thread (mailbox = latest frame wins, stale frames are dropped, no latency build-up).
+- Measured on the tablet (real FFmpeg decode of an 800x480 H.264 test stream): **~71 frames/s read, 63 fps end-to-end**,
+  limited by the ~55 Hz panel refresh. FFmpeg `swscale` alone managed only 25-40 fps for the same scaling.
+- Layout (`EXPER_VIDEO_LAYOUT`, set in `/etc/init.d/exper-auto`; sources in `configs/`):
+  - `fit`: whole 800x480 -> 1024x614 centred (aspect kept, 77 px black bars); `full`: stretched to 1024x768; `1024xH`: in between.
+  - **`4x3` (current default)**: the phone is asked for `margin_width=160` (`VideoConfig.margin_width`, now configurable in
+    `android-auto::VideoConfiguration`). The phone really honours it: the UI is drawn in the centre 640x480 (x=80..720) with black
+    side margins. `drm-show --crop 80,0,640,480` cuts that region and scales it 1.6x to 1024x768: right aspect ratio, no bars.
+  - **Touch with margins**: the phone expects touch coordinates relative to the UI area *without* the margin (it adds the margin
+    itself), and the announced touchscreen size must be the UI size (640x480). `send_touch_event`:
+    `x = (crop.x - margin_w/2) + (raw_x - dst.x) * crop.w / dst.w`. (Sending frame coordinates made the left menu icon hit the mic.)
+- `prepare_display()` unbinds fbcon, blanks `/dev/fb0` and sets the backlight to max via sysfs (`exper-backlight` no longer exists).
+- Needs `cma=64M` on the kernel cmdline (default 16 MB CMA cannot hold 4 x 2.5 MB dumb buffers + fbdev) -> already in `/boot/boot.cmd`.
+
+### 3.4b FFmpeg `-fflags nobuffer` breaks this stream (picture only after ~69 s)
+With `-fflags nobuffer` FFmpeg decoded **zero frames** of the phone's raw H.264 until the next IDR (bisected offline with a recorded
+stream: `EXPER_DUMP_H264=/tmp/aa.h264`, then replay with `ffmpeg -f h264 -i - ...`). The phone *does* send SPS/PPS+IDR right after the
+focus bounce. Flags now: `-fflags flush_packets+discardcorrupt -flags low_delay -probesize 2048 -analyzeduration 0`; picture appears in
+~2 s. Debug helpers: `EXPER_DEBUG_H264=1` (NAL types per chunk), `EXPER_DUMP_H264=path` (first ~3 MB of the stream).
+- Keyframe focus bounce (`android-auto/src/video.rs`) now runs **once per connection / max once per 5 s until media arrives**: the old
+  version bounced on every `StartIndication`, and every bounce makes the phone restart the stream => endless loop, no video.
+- `receive_video`: queue 512 chunks; if it ever fills, drop everything until the next SPS/IDR instead of random P frames.
+
+### 3.5 Hardware scaler (DE1 frontend) on A31s: investigated, NOT working
+Wired up in this session: `DRM_SUN4I` (module), `sun6i_a31s_quirks` got `supports_lvds` + `has_lvds_alt` + `sun6i_tcon_setup_lvds_phy`
+(mainline had no LVDS support for A31/A31s TCON), `allwinner,sun6i-a31-display-frontend` added to `sun4i_frontend_of_table`
+(data: A10 quirks; A33 data behaves the same). Frontend registers are programmed correctly (in/out size, scale factors, buffer
+addresses, coefficients, FRM_CTRL start) but **the overlay stays empty/black** for RGB and NV12, unscaled and scaled, with FE0 or FE1
+(`sun4i-backend frontend_idx=0|1` module parameter, added for the experiment). `FRM_CTRL` keeps REG_RDY/COEF_RDY set (never
+latched). No A31 DEFE/DEBE documentation or BSP source available offline. Primary + overlay planes **without** the frontend
+(unscaled XRGB) work fine. If revisited: look for the BE input select / FE start handshake in the Allwinner A31 BSP (`de_fe.c`, `de_be.c`).
 
 ## 4. Build & Deployment Instructions
 
@@ -133,13 +159,44 @@ sshpass -p exper ssh root@172.16.42.1 "chmod +x /usr/local/bin/exper-auto; nohup
 
 ---
 
-## 5. Next Steps / Kernel Roadmap (When Resuming)
+## 5. Tablet / SD card state (rebuilt 26-27 Oct 2026)
 
-1. **Hardware Video Scaling via Display Engine (`sun4i-drm`):**
-   - Enable `CONFIG_DRM_SUN4I=y` and compile DE1 Display Frontend (`sun6i-a31-display-frontend`) and Backend drivers.
-   - Configure LVDS panel timing in DTS for the 1024×768 panel.
-   - This will allow DRM plane scaling in hardware: FFmpeg decodes 800×480 directly into a DRM dumb buffer, and the hardware scaler scales it edge-to-edge on the 1024×768 LCD with 0% CPU overhead.
-2. **Cedrus VPU Port Evaluation:**
-   - Add DT node for `video-codec@1c0e000` in `sun6i-a31.dtsi`.
-   - Add SRAM C claim logic in `drivers/soc/sunxi/sunxi_sram.c`.
-   - Evaluate A31 VE register map compatibility against A20/A33.
+The original SD card died (unstable reads). New 4 GB SanDisk built with `Exper Easypad 8/scripts/50-sdcard-alpine.sh` (now fixes
+rootfs ownership + setuid bits). Everything else was installed over the USB network (PC does NAT: `ip_forward` + iptables MASQUERADE,
+tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver 1.1.1.1 > /etc/resolv.conf` after every boot).
+
+- Kernel `7.2.0-gf36b54d9862f-dirty`, DTB `sun6i-a31s-exper-t8e-drm.dtb` (boot.scr.drm is the active `boot.scr`; `boot.scr.main` = plain DTB).
+  `/boot` is read-only: `mount -o remount,rw /boot` to update.
+- DRM modules load at boot from `/etc/modules-load.d/exper-drm.conf` (frontend, backend, drc, drm). LVDS panel: 1024x768, 24-bit VESA
+  mapping, 60 MHz pixel clock, 1350x810 total (matches U-Boot `lcd mode`), PWM backlight PH13 + PA25 enable, panel power PG12.
+- Packages: ffmpeg, alsa-utils, hostapd, dnsmasq, iw, wpa_supplicant, evtest, libdrm-tests (`modetest`).
+- Services (OpenRC, sources in `configs/` and `scripts/`): `exper-wifi` (runs `exper-wifi.sh`: `wpa_supplicant` with
+  `/etc/exper-auto/wpa_supplicant.conf` -> phone hotspot `<phone hotspot SSID>` / `<hotspot password>`, `udhcpc`, re-tries when the link drops) and
+  `exper-auto` (needs `exper-wifi`; finds the phone as the `wlan0` default gateway, override with `EXPER_PHONE_ADDR`).
+  `exper-ap` (hostapd+dnsmasq, SSID `Exper-Auto` / `<ap password>`, 192.168.43.1) is installed but removed from the default runlevel
+  (`rc-update add exper-ap default` + `rc-update del exper-wifi default` to switch back). hostapd must not be restarted within the
+  same second (BCM43362 `BRCMF_C_UP -512`), see `wifi-mode.sh`.
+- The phone must have its **hotspot on (2.4 GHz)** before/while the tablet boots; the tablet keeps retrying.
+- Backups of the working card: `Exper Easypad 8/backup/sd-yedek/*.tar.gz` (rootfs + boot).
+- Root SSH works (`root` / `exper`); `exper` user is in `wheel` with sudo.
+
+## 5b. Known issues / observations
+
+- **Hot loop (not reproduced since)**: once, two tokio worker threads spun at 100% doing `recvfrom(fd, "", 1) = 0` (EOF on a socket that
+  is never closed/ignored) while the phone connection was otherwise healthy. Happened after the pipeline was starved by the `full`
+  layout. If it returns: `strace -f -p <tid>`, `ls -l /proc/<pid>/fd`.
+- `full` layout (1024x768 stretch of the whole frame) saturates the CPU together with decode+TLS+Wi-Fi AP (load ~4); `4x3`/`fit` are fine.
+- **Why the tablet is a hotspot client now (root cause of "no mobile data")**: with the tablet as AP, Android (checked with `adb shell
+  dumpsys connectivity`, Infinix X6833B / Android 14) marks the manually-joined `Exper-Auto` as `explicitlySelected + acceptUnvalidated`
+  and keeps it as the default network although it has no internet, so apps (Spotify, browser, Maps) hang. Changing DHCP (no router/DNS)
+  or `network_avoid_bad_wifi=1` did not help. Without manual selection Android refuses to stay on a no-internet Wi-Fi and drops it,
+  so there is no phone-side setting that fixes the "phone joins HU's AP" mode (only the real wireless-AA Bluetooth+`WifiNetworkSpecifier`
+  handshake would). With the phone as the hotspot its own mobile data is the uplink and everything works. Home Wi-Fi networks were
+  "forgotten" on the phone during the experiments (passwords must be re-entered); no other phone settings were left changed.
+
+## 6. Next Steps
+
+1. Real-phone test done (picture, touch with `4x3`, audio over AUX OK). Hotspot mode verified with real phone (video, touch, audio, mobile data all OK). Remaining: long drive test, colour check (BT.601 limited assumed; phone stream may be BT.709).
+3. Re-create `exper-powerd` (screen sleep / power key) - lost with the old card.
+4. Clean the debug cmdline baked into the kernel (`ignore_loglevel debug initcall_debug`) and the bring-up probes (see `Exper Easypad 8/HANDOFF.md` section 6.4).
+5. Optional: Cedrus VPU port, or revisit the DE1 frontend (section 3.5) for zero-CPU scaling.
