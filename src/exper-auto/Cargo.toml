@@ -2,6 +2,7 @@
 name = "exper-auto"
 version = "0.1.0"
 edition = "2024"
+license = "LGPL-3.0-or-later"
 
 [dependencies]
 android-auto = { path = "../android-auto", default-features = false, features = ["tcp"] }
