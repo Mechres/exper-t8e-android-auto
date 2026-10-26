@@ -141,11 +141,11 @@ fn send_touch_event(
     raw_x: u32,
     raw_y: u32,
 ) {
-    // Physical tablet display is 1024x768 fullscreen.
-    // Android Auto video canvas is 800x480.
-    // Map raw touch coordinates edge-to-edge across the entire 8-inch screen:
-    let x = ((raw_x as u64 * 800 + 512) / 1024).min(799) as u32;
-    let y = ((raw_y as u64 * 480 + 384) / 768).min(479) as u32;
+    // Physical tablet display is 1024x768.
+    // Native Android Auto video canvas is 800x480 displayed 1:1 centered:
+    // xoffset = 112, yoffset = 144
+    let x = (raw_x.saturating_sub(112)).min(799);
+    let y = (raw_y.saturating_sub(144)).min(479);
 
     let mut ev = Wifi::InputEventIndication::new();
     ev.set_timestamp(
@@ -302,8 +302,13 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
     }
 
     async fn setup_video(&self) -> Result<(), ()> {
-        println!("[VIDEO] Setting up H.264 FFmpeg video decoder -> /dev/fb0 (1024x768 fullscreen)...");
+        println!("[VIDEO] Setting up H.264 FFmpeg video decoder -> /dev/fb0 (800x480 centered, zero-scaling for ultra-low latency)...");
         let _ = std::process::Command::new("exper-backlight").arg("100").status();
+
+        // Clear screen to black so black margins around 800x480 canvas are clean
+        let _ = std::process::Command::new("dd")
+            .args(["if=/dev/zero", "of=/dev/fb0", "bs=1M", "count=4"])
+            .status();
 
         // Kill any previous ffmpeg if present
         {
@@ -316,8 +321,8 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
 
         let proc = Command::new("ffmpeg")
             .args([
-                "-loglevel", "info",
-                "-threads", "4",
+                "-loglevel", "warning",
+                "-threads", "2",
                 "-flags2", "fast",
                 "-f", "h264",
                 "-probesize", "32",
@@ -325,9 +330,9 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
                 "-fflags", "nobuffer",
                 "-flags", "low_delay",
                 "-i", "-",
-                // Fullscreen edge-to-edge rendering with fast bilinear NEON scaling:
-                "-vf", "scale=1024:768:flags=fast_bilinear",
                 "-pix_fmt", "bgra",
+                "-xoffset", "112",
+                "-yoffset", "144",
                 "-f", "fbdev",
                 "/dev/fb0",
             ])
