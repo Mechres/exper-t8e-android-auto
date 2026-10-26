@@ -1,36 +1,43 @@
 # Exper Easypad 8 Wireless Android Auto Head Unit — Engineering Handoff
 
-## 1. Project Overview & Objective
-This project transforms the **Exper Easypad 8 (T8E)**—an Allwinner A31s (sun6i) quad-core Cortex-A7 tablet running Alpine Linux 3.20 on mainline Linux 7.2—into a dedicated in-car **Wireless Android Auto head unit**. 
-
-- **Display:** Fullscreen edge-to-edge rendering on the native 8.0-inch $1024 \times 768$ LCD via Linux SimpleFB (`/dev/fb0`).
-- **Input:** Capacitive multi-touch input via Goodix GT911 polled directly over I2C (`/dev/i2c-0` @ `0x14`).
-- **Audio Output:** Low-latency 48 kHz stereo audio routed through the tablet's 3.5mm analog headphone jack directly into the car stereo AUX port.
-- **Connectivity:** Autonomous in-car Wi-Fi hotspot (`Exper-Auto`) enabling direct TCP-based wireless Android Auto link to the driver's phone.
-
-Repository path: `~/Projeler/exper-t8e-android-auto`
+**Date:** 26 October 2026 · **Target Architecture:** Allwinner A31s (`sun6i`, 4× Cortex-A7 @ 1.008 GHz, 1 GB DDR3)  
+**OS:** Alpine Linux 3.20 (Kernel 7.2-rc1) · **Display:** 8.0" 1024×768 LVDS (`/dev/fb0`) · **Touch:** Goodix GT911 (`/dev/input/event0`)  
+**Workspace:** `~/Projeler/exper-t8e-android-auto`  
+**Target Device IP:** `172.16.42.1` (`usb0`) / `192.168.43.1` (`wlan0` AP)
 
 ---
 
-## 2. Hardware & Network Topology
+## 1. Project Overview & Objective
+
+Transforms the Exper Easypad 8 (Model T8E) into a dedicated in-car **Wireless Android Auto Head Unit**:
+- **Display Pipeline:** H.264 video decoded via low-latency FFmpeg writing directly to Linux SimpleFB (`/dev/fb0`).
+- **Touch Input:** Native Linux evdev event stream (`/dev/input/event0`, `Goodix Capacitive TouchScreen`), translating gestures into Android Auto `InputEventIndication` (`PRESS`, `RELEASE`, `DRAG`).
+- **Audio Output:** 48 kHz stereo ALSA sink (`aplay`) routed to 3.5mm analog AUX output into car stereo.
+- **Wireless Projection:** Tablet runs standalone autonomous Wi-Fi AP (`Exper-Auto`, `192.168.43.1`). Connects to phone's Android Auto Head Unit Server (port 5277) over mTLS.
+
+---
+
+## 2. Hardware Topology & Benchmark Findings
 
 ```
 +--------------------------------------------------------------------------------+
 |                        EXPER EASYPAD 8 (HEAD UNIT)                             |
 |                                                                                |
-|  Allwinner A31s (4x Cortex-A7 @ 1.0 GHz) - 1 GB DDR3 - Alpine Linux 3.20 (7.2) |
+|  Allwinner A31s (4x Cortex-A7 @ 1.008 GHz fixed) - 1 GB DDR3 @ 432 MHz        |
+|  SimpleFB (/dev/fb0): 1024x768 32-bit BGRA (DRAM backed, no 2D/3D GPU driver)  |
 |                                                                                |
 |  +---------------------------+       +--------------------------------------+  |
 |  |   8" LCD (1024x768)       |       |   Goodix GT911 Touchscreen           |  |
-|  |   /dev/fb0 (32-bit BGRA)  |       |   /dev/i2c-0 @ 0x14 (Polled 66 Hz)   |  |
+|  |   /dev/fb0 (32-bit BGRA)  |       |   /dev/input/event0 (evdev, IRQ)     |  |
 |  +-------------^-------------+       +------------------v-------------------+  |
 |                |                                        |                      |
 |          FFmpeg Decoder                           exper-auto                   |
+|          (-framerate 60)                                |                      |
 |                |                                        |                      |
 |  +-------------+-------------+       +------------------v-------------------+  |
-|  |   3.5mm Stereo AUX Port   |       |   Wi-Fi Access Point (AP6210/BCM43362)| |
+|  |   3.5mm Stereo AUX Port   |       |   Wi-Fi Access Point (BCM43362/AP6210)| |
 |  |   aplay 48kHz S16_LE      |<------+   SSID: Exper-Auto                   |  |
-|  +---------------------------+       |   IP: 192.168.43.1/24 (dnsmasq/dhcp) |  |
+|  +---------------------------+       |   IP: 192.168.43.1/24 (dnsmasq)      |  |
 |                                      +------------------^-------------------+  |
 +---------------------------------------------------------|----------------------+
                                                           | Wi-Fi (802.11 b/g/n)
@@ -38,151 +45,77 @@ Repository path: `~/Projeler/exper-t8e-android-auto`
                                        +--------------------------------------+
                                        |            DRIVER'S PHONE            |
                                        |   Android Auto Head Unit Server      |
-                                       |   IP: 192.168.43.40 : Port 5277      |
+                                       |   Dynamic IP: 192.168.43.x : 5277    |
                                        +--------------------------------------+
 ```
 
-### Network Configuration
-- **Wi-Fi Hotspot (Tablet AP):**
-  - SSID: `Exper-Auto`
-  - WPA2 Passphrase: `experauto2026`
-  - Gateway IP: `192.168.43.1` (netmask `255.255.255.0`)
-  - DHCP Range: `192.168.43.10` – `192.168.43.50` (managed by `dnsmasq`)
-  - Config files: `/etc/exper-auto/hostapd.conf`, `/etc/exper-auto/dnsmasq.conf`
-- **Driver's Phone (Client):**
-  - Static DHCP lease / assigned IP: `192.168.43.40`
-  - Android Auto Head Unit Server Port: `5277` (TCP)
-- **Host PC Debugging Link (USB Gadget):**
-  - Tablet IP: `172.16.42.1` (`usb0`)
-  - Host PC IP: `172.16.42.2`
-  - SSH Access: `sshpass -p exper ssh root@172.16.42.1`
+### Verified Hardware & Performance Benchmarks (Live on Device):
+- **CPU Frequency:** Locked at **1.008 GHz** (`pll-cpu` & `cpu` = 1,008,000,000 Hz in `/sys/kernel/debug/clk/clk_summary`). No cpufreq throttling.
+- **SMP Cores:** All **4 cores online** (`0-3`, `nproc = 4`).
+- **Software Decoding vs. Scaling Benchmarks (Raw A31s Cortex-A7):**
+  - **Raw H.264 decode to null (`-f null`):** **203 FPS** (3.38× realtime).
+  - **1:1 Native Decode to fbdev (`800x480` -> `/dev/fb0`):** **104–109 FPS** (1.74× realtime, CPU load ~34%). Zero latency backlog.
+  - **Software Upscaling to Fullscreen (`scale=1024:768:flags=fast_bilinear`):** **49 FPS** (0.82× realtime). Falls behind 60 FPS input by 180 ms every second, causing an ever-growing queue and 2–3s touch lag.
+  - **Software Upscaling Width-Fit (`scale=1024:614` to fbdev):** **32 FPS** (0.52× realtime). Memory bus bandwidth saturated (~150 MB/s DDR3 traffic).
+- **VPU Hardware Decoding (Cedrus / CedarX):**
+  - Upstream Linux Cedrus driver does **not** support `sun6i` (A31/A31s). `sun6i-a31.dtsi` has no `video-codec` node, and `sunxi_sram.c` has no SRAM C mapping for A31.
+- **GPU (PowerVR SGX544MP2):**
+  - No open-source DRM/Mesa driver exists in mainline Linux. Display is driven strictly via U-Boot SimpleFB (`/dev/fb0`).
+- **Allwinner Display Engine Hardware Scaler (DE1 / DEFE):**
+  - The SoC hardware contains a dedicated display frontend scaler (`sun6i-a31-display-frontend`). Mainline Linux has driver support in `drivers/gpu/drm/sun4i/`, but `CONFIG_DRM_SUN4I` was disabled during initial bring-up in favor of SimpleFB. Enabling DRM KMS is required for hardware-accelerated zero-copy fullscreen scaling.
 
 ---
 
-## 3. Architecture & Software Stack
+## 3. Critical Architecture Fixes Implemented
 
-### 3.1 Sub-crates in Repository
-- **`src/exper-auto/`**:
-  - The main application binary compiled for `armv7-unknown-linux-musleabihf`.
-  - Implements head unit lifecycle traits: `AndroidAutoMainTrait`, `AndroidAutoVideoChannelTrait`, `AndroidAutoAudioOutputTrait`, `AndroidAutoInputChannelTrait`, and `AndroidAutoSensorTrait`.
-  - Spawns and manages FFmpeg and `aplay` child processes.
-  - Houses the singleton hardware I2C touch poller thread.
-- **`src/android-auto/`**:
-  - Fork of `android-auto` protocol crate with crucial upstream fixes:
-    1. **mTLS 1.2 Handshake:** Configured with a patched `rustls-webpki` to accept Google Automotive Link X.509 v1 client certificates without rejecting on legacy basic constraints.
-    2. **TCP Client Interface (`run_tcp_client`):** Connects outbound to phone port 5277 over TCP.
-    3. **Expanded Multiplexer Queue:** TLS queue `chan` capacity expanded from 256 to 2048 packets to prevent channel deadlock under continuous video/touch streaming.
-    4. **Lifecycle Hooks:** Added `main.connect().await` and `main.disconnect().await` calls inside `handle_client_generic`.
+### 3.1 69-Second GOP Keyframe Starvation & Focus Bounce
+- **Root Cause of the 1–2 Minute Delay:**
+  - Google's Android Auto video encoder on the phone operates on a fixed **~69-second GOP (Group of Pictures)** cadence. It only emits an IDR keyframe (SPS/PPS) once every 69 seconds unless specifically provoked.
+  - If the initial keyframe was missed while FFmpeg was initializing, FFmpeg received only non-key P-frames, which it cannot decode. FFmpeg silently discarded all frames until the next GOP keyframe:
+    - 1 GOP missed = **69 seconds** (~1m 5s).
+    - 2 GOPs missed = **138 seconds** (~2m 2s).
+- **The Protocol Lever (Keyframe Focus Bounce):**
+  - AAP has no explicit "request keyframe" protobuf message.
+  - In `src/android-auto/src/video.rs`, on `StartIndication`, we trigger an immediate **Focus Bounce**:
+    1. Send `VideoFocusIndication(focus_mode: UNFOCUSED, unrequested: true)`
+    2. Wait 200 ms (`tokio::time::sleep`)
+    3. Send `VideoFocusIndication(focus_mode: FOCUSED, unrequested: true)`
+  - Android's encoder immediately re-initializes and forces an IDR keyframe with SPS/PPS in **0.2–0.5 seconds**.
 
-### 3.2 Video Pipeline
-- **Stream Negotiation:** Negotiated to 480p H.264 at 30 fps (`Wifi::video_resolution::Enum::_480p`, `video_fps::Enum::_30`).
-- **Decoder & Renderer:** Spawned child process running FFmpeg directly writing to framebuffer:
+### 3.2 Video Flow Control Deadlock (`max_unacked`)
+- In `src/android-auto/src/video.rs`, `AVChannelSetupResponse.max_unacked` was previously set to `1`.
+- At 60 FPS, this enforced a strict stop-and-wait lockstep where the phone waited for an ACK after every single packet. When touch events or audio ACKs contended on the TLS link, the stream deadlocked into `in=0.0/s` for 30 seconds until `BrokenPipe`.
+- Increased `max_unacked` to **10** (matching OpenAuto and other audio channels).
+- Changed `receive_video` from blocking `tx.send().await` to non-blocking `tx.try_send()`, preventing feeder backpressure from blocking the protocol async loop.
+
+### 3.3 TCP Connect Timeout & Dynamic DHCP Resolution
+- In `src/exper-auto/src/main.rs`, `TcpStream::connect` previously blocked on the Linux kernel SYN retransmission timer for **63–65 seconds** if the phone had not yet opened port 5277.
+- Wrapped in `tokio::time::timeout(Duration::from_millis(1500))`. Retries every 500 ms. Connects within 0.5s of phone server launch.
+- Added dynamic lookup from `/var/lib/misc/dnsmasq.leases` to automatically connect to whatever IP the phone is assigned on Wi-Fi (`192.168.43.x`).
+
+### 3.4 Low-Latency 1:1 Rendering & Touch Alignment
+- **FFmpeg Invocation:**
   ```bash
-  ffmpeg -loglevel info \
-    -f h264 -probesize 32 -analyzeduration 0 \
-    -fflags nobuffer -flags low_delay \
-    -i - \
-    -vf scale=1024:768:flags=fast_bilinear \
-    -pix_fmt bgra \
-    -f fbdev /dev/fb0
+  ffmpeg -loglevel warning -threads 2 -flags2 fast \
+    -fflags nobuffer+flush_packets+discardcorrupt -flags low_delay \
+    -fpsprobesize 0 -probesize 2048 -analyzeduration 0 \
+    -f h264 -framerate 60 -i - \
+    -pix_fmt bgra -xoffset 112 -yoffset 144 -f fbdev /dev/fb0
   ```
-- **ARM NEON Acceleration (`flags=fast_bilinear`):**
-  - Benchmark findings on Cortex-A7 Allwinner A31s:
-    - Raw H.264 decode (`-f null`): **235 FPS** (7.8x realtime).
-    - `flags=neighbor`: **13-17 FPS** (unoptimized generic C fallback in libswscale, causing 50% frame deficit and massive queue drift).
-    - `flags=fast_bilinear`: **30-40 FPS** (activates hand-optimized ARM NEON assembly in libswscale, achieving full 30 FPS realtime to `/dev/fb0` at 1.0x speed).
-- **Concurrency & Backpressure Flow Control:**
-  - `receive_video` delivers stamped packets (`VideoChunk { data, enq }`) into a `tokio::sync::mpsc::channel` of depth **16** via `tx.send().await`.
-  - Android Auto protocol enforces `max_unacked = 1`: `MediaIndicationAck` is only transmitted back to the phone once `receive_video` has enqueued the chunk into the feeder queue. This naturally paces the phone's encoder to match the tablet's playback rate with zero packet drops.
-- **Latency Diagnostics (`[VIDEO]` stats line, every 2 s while projecting):**
-  ```
-  [VIDEO] in=30.0/s out=30.0/s queue=1/16 lag last=5ms max=18ms ffmpeg=ok cpu0=n/a load=1.40
-  ```
-
-### 3.3 Audio Pipeline
-- **Channel:** Media audio channel (`AudioChannelType::Media`).
-- **Sink:** Spawned child process feeding ALSA:
-  ```bash
-  aplay -q -D default -r 48000 -f S16_LE -c 2 -
-  ```
-- **Auxiliary Output:** Automatically routes to headphone jack. ALSA mixer master playback volume unmuted and set to 100%.
-
-### 3.2 Network Transport & TLS Multiplexing (`libandroid_auto`)
-- **Transport:** Multiplexed TCP stream (`StreamMux`) carrying encrypted TLS traffic.
-- **Bufferbloat & Latency Elimination:**
-  - **Kernel Socket Level:** `SO_RCVBUF` and `SO_SNDBUF` are explicitly clamped to `65536` (64 KB) on the connected `TcpStream`. This disables Linux TCP auto-tuning from expanding socket buffers up to 6 MB, capping maximum kernel network buffering to $\le 50$ ms.
-  - **TLS Worker Queue Prioritization (`StreamMux`):** In `src/android-auto/src/ssl.rs`, outbound messages (`PlainData` for touch/sensors, `Frame` for ACKs/ping) and inbound encrypted frames (`DecryptMe`) were previously multiplexed into a single 2048-frame queue. Under high-bitrate video, touch events were queued behind hundreds of inbound video frames, producing a 2-second round-trip delay (`Ping response = 1.69s`).
-  - **Fix:** Inbound and outbound channels are decoupled. `SslStreamThread::run` uses `tokio::select! { biased; ... }` to **strictly prioritize outbound traffic**. Whenever a touch event or ACK is queued, it is encrypted and transmitted immediately ($< 1$ ms) before decrypting subsequent video packets.
-  - **Inbound Decrypt Queue:** Bounded to 8 frames, enforcing backpressure directly to the phone via TCP window management. Ping dropped from 1,689 ms to **2.7 ms**.
-
-### 3.3 Video Decoding Pipeline (H.264 & libswscale)
-- **Architecture:** Zero-copy H.264 stream received via `AndroidAutoVideoChannelTrait::receive_video`, fed via bounded Tokio channel (`cap = 1`) into an FFmpeg subprocess decoding directly to `/dev/fb0`.
-- **Latency & Backpressure:**
-  - `VIDEO_QUEUE_CAP = 1`: By bounding the buffer depth to 1 chunk, Tokio backpressure stalls `tx.send().await` when FFmpeg is busy, which in turn delays Android Auto's `AVMediaAckIndication(max_unacked = 1)`.
-  - The driver phone naturally matches the tablet's real-time rendering rate without accumulating multi-second frame queues (`lag = 0ms`, `queue = 0/1`).
-- **Decoder & SIMD Scaler Flags:**
-  - FFmpeg invocation:
-    ```bash
-    ffmpeg -loglevel info -threads 3 -f h264 -probesize 32 -analyzeduration 0 \
-      -fflags nobuffer -flags low_delay -i - \
-      -vf scale=1024:768:flags=fast_bilinear -pix_fmt bgra -f fbdev /dev/fb0
-    ```
-  - Fast bilinear scaling uses hand-optimized ARM NEON assembly routines, rendering at 30-55 FPS realtime on Cortex-A7.
-
-### 3.4 Touchscreen Input Pipeline
-- **Hardware Controller:** Goodix GT911 managed by the Linux kernel `Goodix-TS` driver on I2C bus 0 address `0x5d`.
-- **Driver Model:** Standard Linux `evdev` event stream read directly from `/dev/input/event0` (`Goodix Capacitive TouchScreen`). Interrupt-driven, non-blocking zero CPU polling overhead.
-- **Coordinates & Resolution Mapping:**
-  - Physical LCD panel & GT911 hardware report:
-    $$\text{X}_{\text{panel}} \in [0 \dots 1024], \quad \text{Y}_{\text{panel}} \in [0 \dots 768]$$
-  - Android Auto negotiated video surface: $800 \times 480$.
-  - `InputConfiguration.touchscreen` is advertised as `Some((800, 480))` matching the video canvas.
-  - Runtime scaling formula:
-    $$\text{X}_{\text{AA}} = \min\left(799, \left\lfloor\frac{\text{X}_{\text{panel}} \times 800 + 512}{1024}\right\rfloor\right)$$
-    $$\text{Y}_{\text{AA}} = \min\left(479, \left\lfloor\frac{\text{Y}_{\text{panel}} \times 480 + 384}{768}\right\rfloor\right)$$
-- **Android Auto Event Compatibility:**
-  - `TouchAction::PRESS` (0, Android `ACTION_DOWN`) and `TouchAction::RELEASE` (1, Android `ACTION_UP`) with `TouchAction::DRAG` (2, Android `ACTION_MOVE`).
-  - Instant dispatch without synchronous thread sleeps to prevent evdev queue backlog.
-  - `disp_channel` omitted so the event routes to the primary display.
-- **Drag Tracking:**
-  - `DRAG` events filtered to $\Delta X \ge 3$ or $\Delta Y \ge 3$ pixels with 16 ms intervals (~60 FPS drag tracking).
-
-### 3.5 SMP 4-Core CPU Activation
-- **Kernel State:** Allwinner A31s is now operating with **all 4 Cortex-A7 cores active** (`nproc = 4`, `BogoMIPS = 192.00`).
-- **Configuration:**
-  - Removed `nosmp` from `/boot/boot.cmd` and regenerated `/boot/boot.scr`.
-  - Recompiled kernel `zImage` with `CONFIG_CMDLINE_FORCE=n` and `CONFIG_CMDLINE_EXTEND=y`.
-  - Removed `operating-points` from `cpu0` in Device Tree so `cpufreq-dt` exits cleanly (code 19) without crashing during multi-core boot.
+- **Touch Coordinate Mapping:**
+  $X_{\text{aa}} = \text{clamp}(raw_X - 112, 0, 799)$  
+  $Y_{\text{aa}} = \text{clamp}(raw_Y - 144, 0, 479)$
 
 ---
 
-## 4. Automation & OpenRC Boot Configuration
+## 4. Build & Deployment Instructions
 
-The tablet is fully autonomous and launches the head unit stack on power-up without requiring a host PC or manual terminal commands:
-
-1. **Screen & Backlight (`/etc/local.d/01-backlight.start`):**
-   Calls `/usr/local/bin/exper-backlight 100` on boot, powering on PG12 LCD logic and PA25/PWM0 backlight.
-2. **Wi-Fi Hotspot (`/etc/local.d/02-wifi-ap.start`):**
-   Calls `/usr/local/bin/wifi-mode ap`, configuring `wlan0` to `192.168.43.1` and starting `hostapd` and `dnsmasq`.
-3. **Head Unit Daemon (`/etc/local.d/03-exper-auto.start`):**
-   Launches `/usr/local/bin/exper-auto >> /var/log/exper-auto.log 2>&1 &`.
-4. **Physical Power Key Toggle (`/usr/local/bin/exper-powerd`):**
-   Listens on AXP221 PEK power key. Short press instantly toggles the screen and backlight off / on.
-
----
-
-## 5. Build & Deployment Instructions
-
-### Toolchain Requirements
-- Cross-compiler: ARMv7 hard-float musl/glibc toolchain located at:
-  `~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/`
+### Cross-Toolchain
+- Toolchain: `~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/`
 - Target: `armv7-unknown-linux-musleabihf`
 
-### Compiling `exper-auto`
+### Build Command
 ```bash
-export CC_armv7_unknown_linux_musleabihf="~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-gcc"
-export AR_armv7_unknown_linux_musleabihf="~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-ar"
-
 cd ~/Projeler/exper-t8e-android-auto/src/exper-auto
 cargo build --release --target armv7-unknown-linux-musleabihf \
   --config 'target.armv7-unknown-linux-musleabihf.linker="~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-gcc"'
@@ -191,54 +124,22 @@ cargo build --release --target armv7-unknown-linux-musleabihf \
   target/armv7-unknown-linux-musleabihf/release/exper-auto
 ```
 
-### Deploying to Tablet
+### Deploy to Live Tablet
 ```bash
+sshpass -p exper ssh root@172.16.42.1 "pkill -9 exper-auto || true; pkill -9 ffmpeg || true"
 sshpass -p exper scp target/armv7-unknown-linux-musleabihf/release/exper-auto root@172.16.42.1:/usr/local/bin/exper-auto
+sshpass -p exper ssh root@172.16.42.1 "chmod +x /usr/local/bin/exper-auto; nohup /usr/local/bin/exper-auto >> /var/log/exper-auto.log 2>&1 &"
 ```
 
 ---
 
-## 6. How to Connect & Run in the Vehicle
+## 5. Next Steps / Kernel Roadmap (When Resuming)
 
-1. **Power on Tablet:** Connect 5V power to the tablet DC barrel jack or USB OTG port. The tablet will boot Alpine Linux on its MicroSD card.
-2. **Autonomous Startup:** Within ~25 seconds, the LCD backlight turns on, the `Exper-Auto` Wi-Fi hotspot becomes visible, and `exper-auto` enters its connection loop.
-3. **Connect Phone:**
-   - On the driver's phone, connect Wi-Fi to SSID: **`Exper-Auto`** (Password: `experauto2026`).
-   - The phone will obtain IP `192.168.43.40`.
-4. **Start Projection:**
-   - In Android Auto developer settings on the phone, tap **"Start head unit server"**.
-   - `exper-auto` detects port 5277, completes mTLS handshake, and immediately projects Android Auto (Google Maps, Spotify, Navigation) fullscreen on the tablet.
-5. **Audio:** Plug the car's 3.5mm AUX analog cable into the tablet's headphone jack.
-
----
-
-## 7. Troubleshooting & Diagnostic Cheatsheet
-
-| Symptom | Diagnostic Step | Root Cause & Resolution |
-| :--- | :--- | :--- |
-| **Phone won't connect** | `sshpass -p exper ssh root@172.16.42.1 "nc -zv 192.168.43.40 5277"` | Verify phone is connected to `Exper-Auto` hotspot and Head Unit Server is running in Android Auto developer settings. |
-| **Screen stays black** | `sshpass -p exper ssh root@172.16.42.1 "exper-backlight 100"` | Check if backlight / LCD power (PG12) was turned off by power key daemon. |
-| **Video freezing or lag** | Check `cat /var/log/exper-auto.log` for ping latency | With 4 cores active and `flags=neighbor`, ping latency should stay below 15 ms. If backlog occurs, verify 512-queue is draining. |
-| **Touch unresponsive** | `tail -f /var/log/exper-auto.log \| grep TOUCH` | Check if `[TOUCH] Sent PRESS/DRAG` messages appear. Check `/dev/i2c-0` permissions and I2C address `0x14`. |
-| **Audio silent** | `sshpass -p exper ssh root@172.16.42.1 "amixer set 'Master' 100% unmute"` | Ensure ALSA Master channel is unmuted and headphone cable is fully seated in 3.5mm jack. |
-| **Video picture delayed (seconds/minutes behind reality)** | `sshpass -p exper ssh root@172.16.42.1 "grep '\[VIDEO\]' /var/log/exper-auto.log \| tail -20"` | Compare `in=/s` vs `out=/s` and `lag max=`. If `in > out` persistently, FFmpeg cannot decode/scale at 30 fps: check `ffmpeg=`'s `frame=... fps=...` line in the log, `cpu0` frequency (may be stuck low — cpufreq-dt not bound), and `top` for FFmpeg CPU%. The queue is now capped at 64 chunks with keyframe resync, so lag is bounded even when the decoder is slow. |
-| **Video freezes briefly, then jumps to live** | Look for `[VIDEO] Decoder behind ... resyncing at next keyframe` | Expected behavior of the anti-lag policy: the stale backlog is flushed and the stream resyncs at the next SPS/IDR. Frequent occurrences mean FFmpeg is chronically too slow — see the row above. |
-| **Video stalls permanently** | `sshpass -p exper ssh root@172.16.42.1 "grep 'FFmpeg' /var/log/exper-auto.log \| tail"` | `ffmpeg=DEAD` / `FFmpeg stdin write failed` → the decoder crashed; check FFmpeg's own stderr output just above that line in the log. |
-| **Verify CPU Cores** | `sshpass -p exper ssh root@172.16.42.1 "nproc && cat /sys/devices/system/cpu/online"` | Output must report `4` and `0-3`. If single core, ensure `/boot/boot.scr` and `zImage` were not replaced with `nosmp` builds. |
-
----
-
-## 8. Current Architecture & Performance Assessment
-
-### Summary of Performance Limits on Allwinner A31s (Cortex-A7)
-- **VPU Hardware Decoding (CedarX):** Mainline Linux kernel driver `cedrus` does not have support for `sun6i` (A31/A31s); hardware decoding requires extensive reverse-engineering of VE registers and clocks.
-- **GPU (PowerVR SGX544MP2):** No open-source DRM/Mesa driver exists in mainline Linux; rendering relies on Linux SimpleFB (`/dev/fb0`) over DDR3.
-- **CPU Software Decoding Performance:**
-  - **480p ($800 \times 480 \rightarrow 1024 \times 768$ fullscreen):** Decodes via 4-threaded FFmpeg with NEON `fast_bilinear` scaling at ~30–50 FPS with ~5 ms ping and 0 ms feeder lag.
-  - **720p ($1280 \times 720$):** Phone rejects unless explicitly allowed in phone-side developer settings.
-  - **1080p ($1920 \times 1080$):** Maxes out at 26 FPS on CPU, causing an inevitable backlog.
-
-### Current Deployed State
-- **Repo State:** Clean and committed (`main` branch).
-- **Binary:** Fullscreen 480p with NEON fast-bilinear scaling, 1024×768 touch coordinate mapping, audio sink flow-control ACKs, and decoupled TLS outbound priority.
-- **Service:** Active on tablet (`172.16.42.1`), listening for phone connections.
+1. **Hardware Video Scaling via Display Engine (`sun4i-drm`):**
+   - Enable `CONFIG_DRM_SUN4I=y` and compile DE1 Display Frontend (`sun6i-a31-display-frontend`) and Backend drivers.
+   - Configure LVDS panel timing in DTS for the 1024×768 panel.
+   - This will allow DRM plane scaling in hardware: FFmpeg decodes 800×480 directly into a DRM dumb buffer, and the hardware scaler scales it edge-to-edge on the 1024×768 LCD with 0% CPU overhead.
+2. **Cedrus VPU Port Evaluation:**
+   - Add DT node for `video-codec@1c0e000` in `sun6i-a31.dtsi`.
+   - Add SRAM C claim logic in `drivers/soc/sunxi/sunxi_sram.c`.
+   - Evaluate A31 VE register map compatibility against A20/A33.
