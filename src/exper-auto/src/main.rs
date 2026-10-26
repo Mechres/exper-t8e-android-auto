@@ -631,6 +631,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match tokio::net::TcpStream::connect(&target).await {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
+                // Cap TCP socket buffers to 64 KB to completely eliminate Linux kernel bufferbloat
+                // (prevents multi-megabyte / multi-second socket backlogs during high bitrate video).
+                use std::os::unix::io::AsRawFd;
+                let fd = stream.as_raw_fd();
+                let buf_size: libc::c_int = 65536;
+                unsafe {
+                    let _ = libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        &buf_size as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                    );
+                    let _ = libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &buf_size as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                    );
+                }
+
                 println!("[+] Connected to phone at {}! Starting Android Auto handshake...", target);
 
                 let (send, recv) = tokio::sync::mpsc::channel(100);
