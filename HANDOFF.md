@@ -228,32 +228,17 @@ sshpass -p exper scp target/armv7-unknown-linux-musleabihf/release/exper-auto ro
 
 ---
 
-## 8. Status & Latency Resolution Summary
+## 8. Current Architecture & Performance Assessment
 
-The root causes of the 2–3 second touch and video latency have been identified and resolved:
+### Summary of Performance Limits on Allwinner A31s (Cortex-A7)
+- **VPU Hardware Decoding (CedarX):** Mainline Linux kernel driver `cedrus` does not have support for `sun6i` (A31/A31s); hardware decoding requires extensive reverse-engineering of VE registers and clocks.
+- **GPU (PowerVR SGX544MP2):** No open-source DRM/Mesa driver exists in mainline Linux; rendering relies on Linux SimpleFB (`/dev/fb0`) over DDR3.
+- **CPU Software Decoding Performance:**
+  - **480p ($800 \times 480 \rightarrow 1024 \times 768$ fullscreen):** Decodes via 4-threaded FFmpeg with NEON `fast_bilinear` scaling at ~30–50 FPS with ~5 ms ping and 0 ms feeder lag.
+  - **720p ($1280 \times 720$):** Phone rejects unless explicitly allowed in phone-side developer settings.
+  - **1080p ($1920 \times 1080$):** Maxes out at 26 FPS on CPU, causing an inevitable backlog.
 
-1. **Decoder Bottleneck Eliminated (56 FPS vs 22 FPS):**
-   - Replaced FFmpeg CPU bilinear scaler (`-vf scale=1024:768:flags=fast_bilinear`) with native 1:1 padded rendering (`-vf pad=1024:768:112:144`).
-   - Software scaling of $800 \times 480 \rightarrow 1024 \times 768$ saturated memory bandwidth on Cortex-A7 (capped at 22 FPS vs 30 FPS stream rate), creating a permanent accumulating backlog. Native padding runs at **56 FPS**, completely eliminating decode lag.
-   - Exact 1:1 touch coordinate mapping:
-     $$X_{\text{aa}} = (X_{\text{raw}} - 112).\text{clamp}(0, 799)$$
-     $$Y_{\text{aa}} = (Y_{\text{raw}} - 144).\text{clamp}(0, 479)$$
-
-2. **Decoupled Outbound Prioritization in TLS Transport:**
-   - In [`src/android-auto/src/ssl.rs`](file://~/Projeler/exper-t8e-android-auto/src/android-auto/src/ssl.rs), outbound messages (touch events, pings, ACKs) now use a prioritized queue with `tokio::select! { biased; ... }`.
-   - Touch events and ACKs leave the socket immediately (<1 ms) without waiting behind inbound encrypted video frames.
-
-3. **Audio Sink Flow Control & ACKs Implemented:**
-   - In [`src/android-auto/src/mediaaudio.rs`](file://~/Projeler/exper-t8e-android-auto/src/android-auto/src/mediaaudio.rs), `speechaudio.rs`, and `sysaudio.rs`, session tracking was added and `MediaIndicationAck` is now transmitted for every received audio frame.
-   - Prevents the phone's Android Auto projection engine from exhausting the `max_unacked = 10` flow-control window and stalling media/video sync.
-
-4. **Bounded Queue & Bufferbloat Prevention:**
-   - `VIDEO_QUEUE_CAP` set to 4 chunks (~70 ms jitter cushion).
-   - TCP socket `SO_RCVBUF` / `SO_SNDBUF` capped to 64 KB with `TCP_NODELAY`.
-
-The updated binary is cross-compiled, stripped, and deployed to the tablet (`/usr/local/bin/exper-auto`, active PID running).
-
-To verify real-time responsiveness:
-1. Connect phone to Wi-Fi SSID **`Exper-Auto`** (Password: `experauto2026`).
-2. In Android Auto developer settings on the phone, tap **"Start head unit server"**.
-3. Confirm instantaneous touch feedback on the centered $800 \times 480$ canvas with ping response <15 ms and solid 30+ FPS video.
+### Current Deployed State
+- **Repo State:** Clean and committed (`main` branch).
+- **Binary:** Fullscreen 480p with NEON fast-bilinear scaling, 1024×768 touch coordinate mapping, audio sink flow-control ACKs, and decoupled TLS outbound priority.
+- **Service:** Active on tablet (`172.16.42.1`), listening for phone connections.
