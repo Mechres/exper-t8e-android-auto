@@ -119,7 +119,7 @@ impl ExperAuto {
             },
             input_config: InputConfiguration {
                 keycodes: vec![],
-                touchscreen: Some((1024, 768)),
+                touchscreen: Some((800, 480)),
             },
             sensor_config: SensorInformation { sensors },
         }
@@ -139,9 +139,15 @@ struct LinuxInputEvent {
 fn send_touch_event(
     android_send: &tokio::sync::mpsc::Sender<SendableAndroidAutoMessage>,
     action: Wifi::touch_action::Enum,
-    x: u32,
-    y: u32,
+    raw_x: u32,
+    raw_y: u32,
 ) {
+    // Physical tablet display is 1024x768.
+    // Android Auto video canvas is 800x480.
+    // Map raw touch coordinates directly to Android Auto canvas pixels.
+    let x = ((raw_x as u64 * 800 + 512) / 1024).min(799) as u32;
+    let y = ((raw_y as u64 * 480 + 384) / 768).min(479) as u32;
+
     let mut ev = Wifi::InputEventIndication::new();
     ev.set_timestamp(
         std::time::SystemTime::now()
@@ -149,7 +155,6 @@ fn send_touch_event(
             .unwrap_or_default()
             .as_micros() as u64,
     );
-    ev.set_disp_channel(0);
 
     let mut touch = Wifi::TouchEvent::new();
     touch.set_touch_action(action);
@@ -164,6 +169,7 @@ fn send_touch_event(
     ev.touch_event = ::protobuf::MessageField::some(touch);
 
     let _ = android_send.try_send(AndroidAutoMessage::Input(ev).sendable());
+    println!("[TOUCH] Sent {:?} at raw=({}, {}) -> aa=({}, {})", action, raw_x, raw_y, x, y);
 }
 
 fn spawn_touch_worker() {
@@ -241,29 +247,35 @@ fn spawn_touch_worker() {
                         last_sent_y = cur_y;
                         last_send_time = std::time::Instant::now();
 
-                        if let Some(android_send) = sender_opt {
-                            send_touch_event(&android_send, Wifi::touch_action::Enum::PRESS, cur_x, cur_y);
-                            println!("[TOUCH] Sent PRESS at X={} Y={}", cur_x, cur_y);
+                        if let Some(android_send) = sender_opt.as_ref() {
+                            send_touch_event(android_send, Wifi::touch_action::Enum::PRESS, cur_x, cur_y);
                         }
-                    } else if pending_up {
+                    }
+
+                    if pending_up {
                         pending_up = false;
                         is_down = false;
 
-                        if let Some(android_send) = sender_opt {
-                            send_touch_event(&android_send, Wifi::touch_action::Enum::RELEASE, last_sent_x, last_sent_y);
-                            println!("[TOUCH] Sent RELEASE at X={} Y={}", last_sent_x, last_sent_y);
+                        // Ensure tap has a minimum duration (35 ms) so Android's gesture
+                        // detector reliably registers the click rather than discarding it as noise.
+                        let elapsed = last_send_time.elapsed();
+                        if let Some(rem) = std::time::Duration::from_millis(35).checked_sub(elapsed) {
+                            std::thread::sleep(rem);
+                        }
+
+                        if let Some(android_send) = sender_opt.as_ref() {
+                            send_touch_event(android_send, Wifi::touch_action::Enum::RELEASE, last_sent_x, last_sent_y);
                         }
                     } else if is_down {
                         let dx = (cur_x as i32 - last_sent_x as i32).abs();
                         let dy = (cur_y as i32 - last_sent_y as i32).abs();
-                        if (dx >= 4 || dy >= 4) && last_send_time.elapsed() >= std::time::Duration::from_millis(30) {
+                        if (dx >= 4 || dy >= 4) && last_send_time.elapsed() >= std::time::Duration::from_millis(25) {
                             last_sent_x = cur_x;
                             last_sent_y = cur_y;
                             last_send_time = std::time::Instant::now();
 
-                            if let Some(android_send) = sender_opt {
-                                send_touch_event(&android_send, Wifi::touch_action::Enum::DRAG, cur_x, cur_y);
-                                println!("[TOUCH] Sent DRAG at X={} Y={}", cur_x, cur_y);
+                            if let Some(android_send) = sender_opt.as_ref() {
+                                send_touch_event(android_send, Wifi::touch_action::Enum::DRAG, cur_x, cur_y);
                             }
                         }
                     }
