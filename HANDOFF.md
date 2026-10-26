@@ -107,9 +107,23 @@ Repository path: `~/Projeler/exper-t8e-android-auto`
   ```
 - **Auxiliary Output:** Automatically routes to headphone jack. ALSA mixer master playback volume unmuted and set to 100%.
 
+### 3.3 Video Decoding Pipeline (H.264 & libswscale)
+- **Architecture:** Zero-copy H.264 stream received via `AndroidAutoVideoChannelTrait::receive_video`, fed via bounded Tokio channel (`cap = 1`) into an FFmpeg subprocess decoding directly to `/dev/fb0`.
+- **Latency & Backpressure:**
+  - `VIDEO_QUEUE_CAP = 1`: By bounding the buffer depth to 1 chunk, Tokio backpressure stalls `tx.send().await` when FFmpeg is busy, which in turn delays Android Auto's `AVMediaAckIndication(max_unacked = 1)`.
+  - The driver phone naturally matches the tablet's real-time rendering rate without accumulating multi-second frame queues (`lag = 0ms`, `queue = 0/1`).
+- **Decoder & SIMD Scaler Flags:**
+  - FFmpeg invocation:
+    ```bash
+    ffmpeg -loglevel info -threads 3 -f h264 -probesize 32 -analyzeduration 0 \
+      -fflags nobuffer -flags low_delay -i - \
+      -vf scale=1024:768:flags=fast_bilinear -pix_fmt bgra -f fbdev /dev/fb0
+    ```
+  - Fast bilinear scaling uses hand-optimized ARM NEON assembly routines, rendering at 30-55 FPS realtime on Cortex-A7.
+
 ### 3.4 Touchscreen Input Pipeline
 - **Hardware Controller:** Goodix GT911 managed by the Linux kernel `Goodix-TS` driver on I2C bus 0 address `0x5d`.
-- **Driver Model:** Standard Linux `evdev` event stream read directly from `/dev/input/event0` (`Goodix Capacitive TouchScreen`). Interrupt-driven, zero CPU polling overhead.
+- **Driver Model:** Standard Linux `evdev` event stream read directly from `/dev/input/event0` (`Goodix Capacitive TouchScreen`). Interrupt-driven, non-blocking zero CPU polling overhead.
 - **Coordinates & Resolution Mapping:**
   - Physical LCD panel & GT911 hardware report:
     $$\text{X}_{\text{panel}} \in [0 \dots 1024], \quad \text{Y}_{\text{panel}} \in [0 \dots 768]$$
@@ -120,10 +134,10 @@ Repository path: `~/Projeler/exper-t8e-android-auto`
     $$\text{Y}_{\text{AA}} = \min\left(479, \left\lfloor\frac{\text{Y}_{\text{panel}} \times 480 + 384}{768}\right\rfloor\right)$$
 - **Android Auto Event Compatibility:**
   - `TouchAction::PRESS` (0, Android `ACTION_DOWN`) and `TouchAction::RELEASE` (1, Android `ACTION_UP`) with `TouchAction::DRAG` (2, Android `ACTION_MOVE`).
-  - Guaranteed minimum tap duration of 35 ms before transmitting `RELEASE` to ensure Android's gesture detector registers clicks reliably.
+  - Instant dispatch without synchronous thread sleeps to prevent evdev queue backlog.
   - `disp_channel` omitted so the event routes to the primary display.
-- **Drag Throttling:**
-  - `DRAG` events filtered to $\Delta X \ge 4$ or $\Delta Y \ge 4$ pixels AND at least 25 ms interval (~40 Hz).
+- **Drag Tracking:**
+  - `DRAG` events filtered to $\Delta X \ge 3$ or $\Delta Y \ge 3$ pixels with 16 ms intervals (~60 FPS drag tracking).
 
 ### 3.5 SMP 4-Core CPU Activation
 - **Kernel State:** Allwinner A31s is now operating with **all 4 Cortex-A7 cores active** (`nproc = 4`, `BogoMIPS = 192.00`).
