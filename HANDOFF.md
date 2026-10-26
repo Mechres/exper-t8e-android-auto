@@ -2,7 +2,7 @@
 
 **Date:** 27 October 2026 (updated) · **Target Architecture:** Allwinner A31s (`sun6i`, 4× Cortex-A7 @ 1.008 GHz, 1 GB DDR3)  
 **OS:** Alpine Linux 3.20 (Kernel 7.2-rc1) · **Display:** 8.0" 1024×768 LVDS (`/dev/fb0`) · **Touch:** Goodix GT911 (`/dev/input/event0`)  
-**Workspace:** `~/Projeler/exper-t8e-android-auto`  
+**Board repo:** https://github.com/Mechres/exper-easypad8-t8e-linux (kernel patches, device trees, SD card scripts, hardware findings)  
 **Target Device IP:** `172.16.42.1` (`usb0`) / `192.168.43.1` (`wlan0` AP)
 
 ---
@@ -137,17 +137,24 @@ latched). No A31 DEFE/DEBE documentation or BSP source available offline. Primar
 ## 4. Build & Deployment Instructions
 
 ### Cross-Toolchain
-- Toolchain: `~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/`
-- Target: `armv7-unknown-linux-musleabihf`
+- Any ARMv7 hard-float cross toolchain, e.g. Bootlin `armv7-eabihf--glibc--stable-2024.05-1`; put its `bin/` in `CROSS_BIN`.
+- Rust target: `armv7-unknown-linux-musleabihf` (`rustup target add armv7-unknown-linux-musleabihf`).
 
-### Build Command
+### Build Commands
 ```bash
-cd ~/Projeler/exper-t8e-android-auto/src/exper-auto
-cargo build --release --target armv7-unknown-linux-musleabihf \
-  --config 'target.armv7-unknown-linux-musleabihf.linker="~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-gcc"'
+export CROSS_BIN=/path/to/armv7-eabihf--glibc--stable-2024.05-1/bin
+export PATH="$CROSS_BIN:$PATH" CC_armv7_unknown_linux_musleabihf=arm-linux-gcc
+CFG='target.armv7-unknown-linux-musleabihf.linker="arm-linux-gcc"'
 
-~/Projeler/telefon-canlandirma/piranha-a10/toolchain/armv7-eabihf--glibc--stable-2024.05-1/bin/arm-linux-strip \
-  target/armv7-unknown-linux-musleabihf/release/exper-auto
+# head unit
+(cd src/exper-auto  && cargo build --release --target armv7-unknown-linux-musleabihf --config "$CFG")
+# DRM video output (NEON scaler; needs the cortex-a7 flags, otherwise LLVM does not vectorise)
+(cd src/drm-show    && RUSTFLAGS="-C target-cpu=cortex-a7 -C target-feature=+neon,+vfp4" \
+                       cargo build --release --target armv7-unknown-linux-musleabihf --config "$CFG")
+# power key / external power daemon
+(cd src/exper-powerd && cargo build --release --target armv7-unknown-linux-musleabihf --config "$CFG")
+
+arm-linux-strip src/*/target/armv7-unknown-linux-musleabihf/release/{exper-auto,drm-show,exper-powerd}
 ```
 
 ### Deploy to Live Tablet
@@ -161,11 +168,11 @@ sshpass -p exper ssh root@172.16.42.1 "chmod +x /usr/local/bin/exper-auto; nohup
 
 ## 5. Tablet / SD card state (rebuilt 26-27 Oct 2026)
 
-The original SD card died (unstable reads). New 4 GB SanDisk built with `Exper Easypad 8/scripts/50-sdcard-alpine.sh` (now fixes
+The original SD card died (unstable reads). New 4 GB SanDisk built with `scripts/50-sdcard-alpine.sh` of the board repo (now fixes
 rootfs ownership + setuid bits). Everything else was installed over the USB network (PC does NAT: `ip_forward` + iptables MASQUERADE,
 tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver 1.1.1.1 > /etc/resolv.conf` after every boot).
 
-- Kernel `7.2.0-gdbd482bca8d3` (clean 10-patch series on branch `t8e-final`, see `telefon-canlandirma/Exper Easypad 8/docs/04-drm-lvds-ekran.md`; boots in 1.8 s to init, DRM ready at 4.5 s), DTB `sun6i-a31s-exper-t8e-drm.dtb` (`boot.scr` loads `zImage-new` + `...-drm-new.dtb`; the previous debug kernel stays on the card as `zImage` / `boot.scr.old`).
+- Kernel `7.2.0-gdbd482bca8d3` (clean 10-patch series on branch `t8e-final`, see Findings 47-49 in the board repo's `docs/FINDINGS.md`; boots in 1.8 s to init, DRM ready at 4.5 s), DTB `sun6i-a31s-exper-t8e-drm.dtb` (`boot.scr` loads `zImage-new` + `...-drm-new.dtb`; the previous debug kernel stays on the card as `zImage` / `boot.scr.old`).
   `/boot` is read-only: `mount -o remount,rw /boot` to update.
 - DRM modules load at boot from `/etc/modules-load.d/exper-drm.conf` (frontend, backend, drc, drm). LVDS panel: 1024x768, 24-bit VESA
   mapping, 60 MHz pixel clock, 1350x810 total (matches U-Boot `lcd mode`), PWM backlight PH13 + PA25 enable, panel power PG12.
@@ -177,7 +184,6 @@ tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver
   (`rc-update add exper-ap default` + `rc-update del exper-wifi default` to switch back). hostapd must not be restarted within the
   same second (BCM43362 `BRCMF_C_UP -512`), see `wifi-mode.sh`.
 - The phone must have its **hotspot on (2.4 GHz)** before/while the tablet boots; the tablet keeps retrying.
-- Backups of the working card: `Exper Easypad 8/backup/sd-yedek/*.tar.gz` (rootfs + boot).
 - Root SSH works (`root` / `exper`); `exper` user is in `wheel` with sudo.
 
 ## 5b. Known issues / observations
@@ -191,8 +197,7 @@ tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver
   and keeps it as the default network although it has no internet, so apps (Spotify, browser, Maps) hang. Changing DHCP (no router/DNS)
   or `network_avoid_bad_wifi=1` did not help. Without manual selection Android refuses to stay on a no-internet Wi-Fi and drops it,
   so there is no phone-side setting that fixes the "phone joins HU's AP" mode (only the real wireless-AA Bluetooth+`WifiNetworkSpecifier`
-  handshake would). With the phone as the hotspot its own mobile data is the uplink and everything works. Home Wi-Fi networks were
-  "forgotten" on the phone during the experiments (passwords must be re-entered); no other phone settings were left changed.
+  handshake would). With the phone as the hotspot its own mobile data is the uplink and everything works..
 
 ## 5c. `exper-powerd` (power key / external power)
 
@@ -201,7 +206,7 @@ tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver
   holding >= `long_press_ms` (3 s) runs `poweroff` (acts on hold, not on release).
 - External power (`axp22x-ac`/`axp20x-usb` `online`) lost (car ignition off): screen off after `loss_screen_off_s` (15), `poweroff` after
   `loss_poweroff_s` (300); power back restores the screen unless the user blanked it. Battery <= `low_batt_pct` (5 %) and not charging -> `poweroff`.
-- Test overrides: `EXPER_POWERD_CONF/_SUPPLY_DIR/_BACKLIGHT_DIR/_INPUT/_POWEROFF_CMD` (the repo history has an end-to-end test using a FIFO and fake sysfs).
+- Test overrides: `EXPER_POWERD_CONF/_SUPPLY_DIR/_BACKLIGHT_DIR/_INPUT/_POWEROFF_CMD` (the state machine has unit tests; the binary was also exercised end to end with a fake sysfs tree and an input FIFO).
 - Verified on the tablet: short press blanks/unblanks the screen. Power-loss path only verified with fake sysfs. Note: unplugging the PC USB cable
   from the tablet while it has no other power starts the 5 minute shutdown timer.
 - Not handled: waking from a fully powered-off state when the ignition returns (depends on the PMIC/U-Boot power-on behaviour).
@@ -210,5 +215,5 @@ tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver
 
 1. Real-phone test done (picture, touch with `4x3`, audio over AUX OK). Hotspot mode verified with real phone (video, touch, audio, mobile data all OK). Remaining: long drive test, colour check (BT.601 limited assumed; phone stream may be BT.709).
 3. ~~Re-create `exper-powerd`~~ done (see 5c).
-4. Clean the debug cmdline baked into the kernel (`ignore_loglevel debug initcall_debug`) and the bring-up probes (see `Exper Easypad 8/HANDOFF.md` section 6.4).
+4. ~~Clean the debug kernel~~ done: clean patch series in the board repo (Finding 49).
 5. Optional: Cedrus VPU port, or revisit the DE1 frontend (section 3.5) for zero-CPU scaling.
