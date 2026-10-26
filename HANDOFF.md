@@ -108,21 +108,20 @@ Repository path: `~/Projeler/exper-t8e-android-auto`
 - **Auxiliary Output:** Automatically routes to headphone jack. ALSA mixer master playback volume unmuted and set to 100%.
 
 ### 3.4 Touchscreen Input Pipeline
-- **Hardware Controller:** Goodix GT911 at I2C bus 0 address `0x14`.
-- **Driver Model:** Polled continuously via direct userspace I2C ioctl (`I2C_SLAVE`, `0x14` on `/dev/i2c-0`) at 66 Hz (15 ms intervals).
-- **Coordinate Transformation:**
-  - Raw hardware registers swap axes:
-    $$\text{X}_{\text{screen}} = \text{raw\_y} \quad (0 \dots 1024)$$
-    $$\text{Y}_{\text{screen}} = \text{raw\_x} \quad (0 \dots 768)$$
+- **Hardware Controller:** Goodix GT911 managed by the Linux kernel `Goodix-TS` driver on I2C bus 0 address `0x5d`.
+- **Driver Model:** Standard Linux `evdev` event stream read directly from `/dev/input/event0` (`Goodix Capacitive TouchScreen`). Interrupt-driven, zero CPU polling overhead.
+- **Coordinates & Range:**
+  - The kernel driver natively outputs calibrated coordinates matching the 8" panel:
+    $$\text{X}_{\text{screen}} \in [0 \dots 1024]$$
+    $$\text{Y}_{\text{screen}} \in [0 \dots 768]$$
 - **Android Auto MotionEvent Compatibility:**
-  - Protobuf `TouchEvent` must specify:
+  - Protobuf `TouchEvent` specifies:
     - `touch.set_action_index(0)`
     - `ev.set_disp_channel(0)`
     - `InputConfiguration.touchscreen = Some((1024, 768))`
-- **Rate Limiting & Delta Throttling:**
-  - `PRESS` and `RELEASE` are sent immediately without delay.
-  - `DRAG` events are filtered: only transmitted if $\Delta X \ge 4$ or $\Delta Y \ge 4$ pixels AND at least 35 ms has elapsed since the prior event.
-  - Hardware buffer register `0x814E` is cleared (`0x00`) on every cycle to keep the touch IC buffer flowing.
+- **Rate Limiting & Throttling:**
+  - `PRESS` and `RELEASE` are transmitted instantly on `BTN_TOUCH` / `ABS_MT_TRACKING_ID` state transitions.
+  - `DRAG` events are filtered: only transmitted if $\Delta X \ge 4$ or $\Delta Y \ge 4$ pixels AND at least 30 ms has elapsed since the prior event.
 
 ### 3.5 SMP 4-Core CPU Activation
 - **Kernel State:** Allwinner A31s is now operating with **all 4 Cortex-A7 cores active** (`nproc = 4`, `BogoMIPS = 192.00`).

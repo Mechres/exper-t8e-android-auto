@@ -126,181 +126,149 @@ impl ExperAuto {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct LinuxInputEvent {
+    tv_sec: u32,
+    tv_usec: u32,
+    type_: u16,
+    code: u16,
+    value: i32,
+}
+
+fn send_touch_event(
+    android_send: &tokio::sync::mpsc::Sender<SendableAndroidAutoMessage>,
+    action: Wifi::touch_action::Enum,
+    x: u32,
+    y: u32,
+) {
+    let mut ev = Wifi::InputEventIndication::new();
+    ev.set_timestamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64,
+    );
+    ev.set_disp_channel(0);
+
+    let mut touch = Wifi::TouchEvent::new();
+    touch.set_touch_action(action);
+    touch.set_action_index(0);
+
+    let mut loc = Wifi::TouchLocation::new();
+    loc.set_pointer_id(0);
+    loc.set_x(x);
+    loc.set_y(y);
+    touch.touch_location.push(loc);
+
+    ev.touch_event = ::protobuf::MessageField::some(touch);
+
+    let _ = android_send.try_send(AndroidAutoMessage::Input(ev).sendable());
+}
+
 fn spawn_touch_worker() {
     tokio::task::spawn_blocking(move || {
-        use std::os::unix::io::AsRawFd;
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/i2c-0")
-        {
+        use std::io::Read;
+        let mut file = match std::fs::File::open("/dev/input/event0") {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[TOUCH] Failed to open /dev/i2c-0: {}", e);
+                eprintln!("[TOUCH] Failed to open /dev/input/event0: {}", e);
                 return;
             }
         };
 
-        let fd = file.as_raw_fd();
-        // `libc::Ioctl` is c_int on the musl (ARM) target and c_ulong on gnu hosts, so name it
-        // via the alias to keep the touch poller compiling for both native tests and ARM.
-        const I2C_SLAVE: libc::Ioctl = 0x0703;
-        let res = unsafe { libc::ioctl(fd, I2C_SLAVE, 0x14 as libc::c_int) };
-        if res < 0 {
-            eprintln!("[TOUCH] Failed to set I2C_SLAVE 0x14: {}", std::io::Error::last_os_error());
-            return;
-        }
+        println!("[TOUCH] Goodix GT911 touch event listener active on /dev/input/event0");
 
-        println!("[TOUCH] Goodix GT911 hardware touch poller active on /dev/i2c-0 @ 0x14");
-
-        let mut was_down = false;
-        let mut last_x = 512;
-        let mut last_y = 384;
+        let mut is_down = false;
+        let mut cur_x: u32 = 512;
+        let mut cur_y: u32 = 384;
+        let mut last_sent_x: u32 = 512;
+        let mut last_sent_y: u32 = 384;
         let mut last_send_time = std::time::Instant::now();
+        let mut pending_down = false;
+        let mut pending_up = false;
 
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(15));
+        let mut buf = [0u8; 16];
 
-            let reg_buf = [0x81u8, 0x4Eu8];
-            let wr = unsafe {
-                libc::write(fd, reg_buf.as_ptr() as *const libc::c_void, 2)
-            };
-            if wr != 2 {
-                continue;
-            }
+        while file.read_exact(&mut buf).is_ok() {
+            let ev: LinuxInputEvent = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const LinuxInputEvent) };
 
-            let mut read_buf = [0u8; 8];
-            let rd = unsafe {
-                libc::read(fd, read_buf.as_mut_ptr() as *mut libc::c_void, 8)
-            };
-            if rd != 8 {
-                continue;
-            }
+            const EV_SYN: u16 = 0x00;
+            const EV_KEY: u16 = 0x01;
+            const EV_ABS: u16 = 0x03;
+            const BTN_TOUCH: u16 = 330;
+            const ABS_X: u16 = 0;
+            const ABS_Y: u16 = 1;
+            const ABS_MT_POSITION_X: u16 = 53;
+            const ABS_MT_POSITION_Y: u16 = 54;
+            const ABS_MT_TRACKING_ID: u16 = 57;
 
-            let status = read_buf[0];
-            if (status & 0x80) != 0 {
-                let is_connected = CONNECTED.load(Ordering::SeqCst);
-                let sender_opt = if is_connected {
-                    GLOBAL_TOUCH_TX.lock().unwrap().clone()
-                } else {
-                    None
-                };
-
-                if sender_opt.is_none() {
-                    let clear_buf = [0x81u8, 0x4Eu8, 0x00u8];
-                    let _ = unsafe {
-                        libc::write(fd, clear_buf.as_ptr() as *const libc::c_void, 3)
-                    };
-                    was_down = false;
-                    continue;
-                }
-
-                let android_send = sender_opt.unwrap();
-                let points = status & 0x0F;
-                if points > 0 {
-                    let raw_x = (read_buf[2] as u32) | ((read_buf[3] as u32) << 8);
-                    let raw_y = (read_buf[4] as u32) | ((read_buf[5] as u32) << 8);
-
-                    // 1:1 hardware to 1024x768 touchscreen mapping
-                    // Goodix has swapped X and Y:
-                    // X_screen is raw_y (0..1024)
-                    // Y_screen is raw_x (0..768)
-                    let x = raw_y.clamp(0, 1024);
-                    let y = raw_x.clamp(0, 768);
-
-                    if !was_down {
-                        was_down = true;
-                        last_x = x;
-                        last_y = y;
-                        last_send_time = std::time::Instant::now();
-
-                        let mut ev = Wifi::InputEventIndication::new();
-                        ev.set_timestamp(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_micros() as u64,
-                        );
-                        ev.set_disp_channel(0);
-
-                        let mut touch = Wifi::TouchEvent::new();
-                        touch.set_touch_action(Wifi::touch_action::Enum::PRESS);
-                        touch.set_action_index(0);
-
-                        let mut loc = Wifi::TouchLocation::new();
-                        loc.set_pointer_id(0);
-                        loc.set_x(x);
-                        loc.set_y(y);
-                        touch.touch_location.push(loc);
-
-                        ev.touch_event = ::protobuf::MessageField::some(touch);
-
-                        let _ = android_send.try_send(AndroidAutoMessage::Input(ev).sendable());
-                        println!("[TOUCH] Sent PRESS at X={} Y={}", x, y);
-                    } else {
-                        let dx = (x as i32 - last_x as i32).abs();
-                        let dy = (y as i32 - last_y as i32).abs();
-                        if (dx >= 4 || dy >= 4) && last_send_time.elapsed() >= std::time::Duration::from_millis(35) {
-                            last_x = x;
-                            last_y = y;
-                            last_send_time = std::time::Instant::now();
-
-                            let mut ev = Wifi::InputEventIndication::new();
-                            ev.set_timestamp(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_micros() as u64,
-                            );
-                            ev.set_disp_channel(0);
-
-                            let mut touch = Wifi::TouchEvent::new();
-                            touch.set_touch_action(Wifi::touch_action::Enum::DRAG);
-                            touch.set_action_index(0);
-
-                            let mut loc = Wifi::TouchLocation::new();
-                            loc.set_pointer_id(0);
-                            loc.set_x(x);
-                            loc.set_y(y);
-                            touch.touch_location.push(loc);
-
-                            ev.touch_event = ::protobuf::MessageField::some(touch);
-
-                            let _ = android_send.try_send(AndroidAutoMessage::Input(ev).sendable());
-                            println!("[TOUCH] Sent DRAG at X={} Y={}", x, y);
+            match ev.type_ {
+                EV_KEY => {
+                    if ev.code == BTN_TOUCH {
+                        if ev.value == 1 {
+                            pending_down = true;
+                        } else if ev.value == 0 {
+                            pending_up = true;
                         }
                     }
-                } else if was_down {
-                    was_down = false;
-                    let mut ev = Wifi::InputEventIndication::new();
-                    ev.set_timestamp(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as u64,
-                    );
-                    ev.set_disp_channel(0);
-
-                    let mut touch = Wifi::TouchEvent::new();
-                    touch.set_touch_action(Wifi::touch_action::Enum::RELEASE);
-                    touch.set_action_index(0);
-
-                    let mut loc = Wifi::TouchLocation::new();
-                    loc.set_pointer_id(0);
-                    loc.set_x(last_x);
-                    loc.set_y(last_y);
-                    touch.touch_location.push(loc);
-
-                    ev.touch_event = ::protobuf::MessageField::some(touch);
-
-                    let _ = android_send.try_send(AndroidAutoMessage::Input(ev).sendable());
-                    println!("[TOUCH] Sent RELEASE at X={} Y={}", last_x, last_y);
                 }
+                EV_ABS => {
+                    if ev.code == ABS_X || ev.code == ABS_MT_POSITION_X {
+                        cur_x = (ev.value.clamp(0, 1024)) as u32;
+                    } else if ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y {
+                        cur_y = (ev.value.clamp(0, 768)) as u32;
+                    } else if ev.code == ABS_MT_TRACKING_ID {
+                        if ev.value >= 0 {
+                            pending_down = true;
+                        } else {
+                            pending_up = true;
+                        }
+                    }
+                }
+                EV_SYN => {
+                    let is_connected = CONNECTED.load(Ordering::SeqCst);
+                    let sender_opt = if is_connected {
+                        GLOBAL_TOUCH_TX.lock().unwrap().clone()
+                    } else {
+                        None
+                    };
 
-                let clear_buf = [0x81u8, 0x4Eu8, 0x00u8];
-                let _ = unsafe {
-                    libc::write(fd, clear_buf.as_ptr() as *const libc::c_void, 3)
-                };
+                    if pending_down {
+                        pending_down = false;
+                        is_down = true;
+                        last_sent_x = cur_x;
+                        last_sent_y = cur_y;
+                        last_send_time = std::time::Instant::now();
+
+                        if let Some(android_send) = sender_opt {
+                            send_touch_event(&android_send, Wifi::touch_action::Enum::PRESS, cur_x, cur_y);
+                            println!("[TOUCH] Sent PRESS at X={} Y={}", cur_x, cur_y);
+                        }
+                    } else if pending_up {
+                        pending_up = false;
+                        is_down = false;
+
+                        if let Some(android_send) = sender_opt {
+                            send_touch_event(&android_send, Wifi::touch_action::Enum::RELEASE, last_sent_x, last_sent_y);
+                            println!("[TOUCH] Sent RELEASE at X={} Y={}", last_sent_x, last_sent_y);
+                        }
+                    } else if is_down {
+                        let dx = (cur_x as i32 - last_sent_x as i32).abs();
+                        let dy = (cur_y as i32 - last_sent_y as i32).abs();
+                        if (dx >= 4 || dy >= 4) && last_send_time.elapsed() >= std::time::Duration::from_millis(30) {
+                            last_sent_x = cur_x;
+                            last_sent_y = cur_y;
+                            last_send_time = std::time::Instant::now();
+
+                            if let Some(android_send) = sender_opt {
+                                send_touch_event(&android_send, Wifi::touch_action::Enum::DRAG, cur_x, cur_y);
+                                println!("[TOUCH] Sent DRAG at X={} Y={}", cur_x, cur_y);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     });
