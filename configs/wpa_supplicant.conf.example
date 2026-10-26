@@ -1,0 +1,11 @@
+# Wi-Fi client configuration: the tablet joins the phone's hotspot.
+# Copy to /etc/exper-auto/wpa_supplicant.conf on the tablet (chmod 600) and fill in your phone's hotspot.
+# The hotspot must use 2.4 GHz (the BCM43362 Wi-Fi chip has no 5 GHz).
+ctrl_interface=/run/wpa_supplicant
+country=TR
+network={
+	ssid="<phone hotspot SSID>"
+	psk="<hotspot password>"
+	key_mgmt=WPA-PSK
+	scan_ssid=1
+}

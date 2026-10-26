@@ -3,3 +3,13 @@ target/
 *.raw
 *.png
 *.log
+
+# Real (private) Wi-Fi credentials: copy configs/*.example to /etc/exper-auto/ on the tablet and edit them there
+configs/wpa_supplicant.conf
+configs/hostapd.conf
+*.bundle
+
+# Third-party reference projects checked out next to the sources (not part of this repository)
+src/AARE/
+src/aa-test/
+src/open-headunit/

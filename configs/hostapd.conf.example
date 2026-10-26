@@ -1,3 +1,5 @@
+# Optional own access point (exper-ap service, disabled by default; see HANDOFF.md section 5b for why the phone hotspot is used instead).
+# Copy to /etc/exper-auto/hostapd.conf and set a real passphrase.
 # Exper-Auto in-car Wi-Fi Hotspot
 interface=wlan0
 driver=nl80211

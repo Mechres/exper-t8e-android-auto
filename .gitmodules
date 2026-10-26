@@ -1,0 +1,3 @@
+[submodule "src/android-auto"]
+	path = src/android-auto
+	url = https://github.com/Mechres/android-auto.git
