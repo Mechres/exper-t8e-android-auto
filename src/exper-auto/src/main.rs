@@ -332,7 +332,7 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
                 "-probesize", "2048",
                 "-analyzeduration", "0",
                 "-f", "h264",
-                "-r", "60",
+                "-framerate", "60",
                 "-i", "-",
                 "-pix_fmt", "bgra",
                 "-xoffset", "112",
