@@ -10,9 +10,9 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 static GLOBAL_TOUCH_TX: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SendableAndroidAutoMessage>>> =
     std::sync::Mutex::new(None);
 
-/// Video feeder queue depth. Bounded to 4 chunks (~70ms max jitter buffer at 55 FPS)
+/// Video feeder queue depth. Bounded to 16 chunks (~250ms max jitter buffer)
 /// to allow smooth Wi-Fi packet bursts without ever blocking the protocol event loop.
-const VIDEO_QUEUE_CAP: usize = 4;
+const VIDEO_QUEUE_CAP: usize = 16;
 
 /// One H.264 chunk on its way to FFmpeg, stamped with its enqueue time so the feeder can
 /// report real end-to-end pipeline lag instead of guessing.
@@ -292,12 +292,12 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
         if let Some(tx) = sender {
             VIDEO_STATS.enqueued.fetch_add(1, Ordering::Relaxed);
             VIDEO_STATS.queued.fetch_add(1, Ordering::Relaxed);
-            // Propagate backpressure to Android Auto's AVMediaAckIndication:
-            // The ACK is only sent after the feeder queue has room for this chunk.
-            let _ = tx.send(VideoChunk {
+            // Non-blocking try_send: NEVER stall the async protocol event loop,
+            // ensuring MediaIndicationAck and Pings are transmitted without delay!
+            let _ = tx.try_send(VideoChunk {
                 data,
                 enq: std::time::Instant::now(),
-            }).await;
+            });
         }
     }
 
@@ -332,6 +332,7 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
                 "-probesize", "2048",
                 "-analyzeduration", "0",
                 "-f", "h264",
+                "-r", "60",
                 "-i", "-",
                 "-pix_fmt", "bgra",
                 "-xoffset", "112",
