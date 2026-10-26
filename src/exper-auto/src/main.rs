@@ -305,10 +305,12 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
         println!("[VIDEO] Setting up H.264 FFmpeg video decoder -> /dev/fb0 (800x480 centered, zero-scaling for ultra-low latency)...");
         let _ = std::process::Command::new("exper-backlight").arg("100").status();
 
-        // Clear screen to black so black margins around 800x480 canvas are clean
-        let _ = std::process::Command::new("dd")
-            .args(["if=/dev/zero", "of=/dev/fb0", "bs=1M", "count=4"])
-            .status();
+        // Clear screen to black asynchronously so black margins around 800x480 canvas are clean
+        tokio::task::spawn_blocking(|| {
+            let _ = std::process::Command::new("dd")
+                .args(["if=/dev/zero", "of=/dev/fb0", "bs=1M", "count=4"])
+                .status();
+        });
 
         // Kill any previous ffmpeg if present
         {
@@ -324,11 +326,12 @@ impl AndroidAutoVideoChannelTrait for ExperAuto {
                 "-loglevel", "warning",
                 "-threads", "2",
                 "-flags2", "fast",
-                "-f", "h264",
-                "-probesize", "32",
-                "-analyzeduration", "0",
-                "-fflags", "nobuffer",
+                "-fflags", "nobuffer+flush_packets+discardcorrupt",
                 "-flags", "low_delay",
+                "-fpsprobesize", "0",
+                "-probesize", "2048",
+                "-analyzeduration", "0",
+                "-f", "h264",
                 "-i", "-",
                 "-pix_fmt", "bgra",
                 "-xoffset", "112",
@@ -630,14 +633,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         custom_certificate: None,
     };
 
-    let target_ip = "192.168.43.40";
-    let target_port = 5277;
-    let target = format!("{}:{}", target_ip, target_port);
+    fn get_phone_target() -> String {
+        if let Ok(content) = std::fs::read_to_string("/var/lib/misc/dnsmasq.leases") {
+            for line in content.lines().rev() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 && parts[2].starts_with("192.168.43.") {
+                    return format!("{}:5277", parts[2]);
+                }
+            }
+        }
+        "192.168.43.40:5277".to_string()
+    }
 
     loop {
-        println!("[*] Waiting for phone connection on {}...", target);
-        match tokio::net::TcpStream::connect(&target).await {
-            Ok(stream) => {
+        let target = get_phone_target();
+        println!("[*] Probing phone head unit server on {}...", target);
+
+        // Bounded 1.5s timeout on connect:
+        // Prevents the Linux kernel TCP SYN retransmission loop from blocking
+        // for 63-65 seconds (1m 5s!) when the phone is not ready yet.
+        match tokio::time::timeout(
+            Duration::from_millis(1500),
+            tokio::net::TcpStream::connect(&target),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
                 // Cap TCP socket buffers to 64 KB to completely eliminate Linux kernel bufferbloat
                 // (prevents multi-megabyte / multi-second socket backlogs during high bitrate video).
@@ -669,10 +690,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = android_auto::run_tcp_client(stream, config.clone(), &setup, &app).await {
                     eprintln!("[-] Session ended with error: {:?}", e);
                 }
-                println!("[*] Connection closed. Reconnecting in 2 seconds...");
-            }
-            Err(_) => {
+                println!("[*] Connection closed. Reconnecting in 1 second...");
                 tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Connection refused or timed out; poll again in 500ms for instantaneous connect
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
