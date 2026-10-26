@@ -107,6 +107,14 @@ Repository path: `~/Projeler/exper-t8e-android-auto`
   ```
 - **Auxiliary Output:** Automatically routes to headphone jack. ALSA mixer master playback volume unmuted and set to 100%.
 
+### 3.2 Network Transport & TLS Multiplexing (`libandroid_auto`)
+- **Transport:** Multiplexed TCP stream (`StreamMux`) carrying encrypted TLS traffic.
+- **Bufferbloat & Latency Elimination:**
+  - **Kernel Socket Level:** `SO_RCVBUF` and `SO_SNDBUF` are explicitly clamped to `65536` (64 KB) on the connected `TcpStream`. This disables Linux TCP auto-tuning from expanding socket buffers up to 6 MB, capping maximum kernel network buffering to $\le 50$ ms.
+  - **TLS Worker Queue Prioritization (`StreamMux`):** In `src/android-auto/src/ssl.rs`, outbound messages (`PlainData` for touch/sensors, `Frame` for ACKs/ping) and inbound encrypted frames (`DecryptMe`) were previously multiplexed into a single 2048-frame queue. Under high-bitrate video, touch events were queued behind hundreds of inbound video frames, producing a 2-second round-trip delay (`Ping response = 1.69s`).
+  - **Fix:** Inbound and outbound channels are decoupled. `SslStreamThread::run` uses `tokio::select! { biased; ... }` to **strictly prioritize outbound traffic**. Whenever a touch event or ACK is queued, it is encrypted and transmitted immediately ($< 1$ ms) before decrypting subsequent video packets.
+  - **Inbound Decrypt Queue:** Bounded to 8 frames, enforcing backpressure directly to the phone via TCP window management. Ping dropped from 1,689 ms to **2.7 ms**.
+
 ### 3.3 Video Decoding Pipeline (H.264 & libswscale)
 - **Architecture:** Zero-copy H.264 stream received via `AndroidAutoVideoChannelTrait::receive_video`, fed via bounded Tokio channel (`cap = 1`) into an FFmpeg subprocess decoding directly to `/dev/fb0`.
 - **Latency & Backpressure:**
