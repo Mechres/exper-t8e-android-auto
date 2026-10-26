@@ -194,9 +194,21 @@ tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver
   handshake would). With the phone as the hotspot its own mobile data is the uplink and everything works. Home Wi-Fi networks were
   "forgotten" on the phone during the experiments (passwords must be re-entered); no other phone settings were left changed.
 
+## 5c. `exper-powerd` (power key / external power)
+
+`src/exper-powerd/` (std-only Rust, unit-tested state machine) + `configs/exper-powerd.initd`, `configs/powerd.conf` -> `/etc/exper-auto/powerd.conf`.
+- Power key (`axp20x-pek`, `/dev/input/event1`, KEY_POWER): short press toggles the screen (`/sys/class/backlight/backlight/bl_power` 0/4),
+  holding >= `long_press_ms` (3 s) runs `poweroff` (acts on hold, not on release).
+- External power (`axp22x-ac`/`axp20x-usb` `online`) lost (car ignition off): screen off after `loss_screen_off_s` (15), `poweroff` after
+  `loss_poweroff_s` (300); power back restores the screen unless the user blanked it. Battery <= `low_batt_pct` (5 %) and not charging -> `poweroff`.
+- Test overrides: `EXPER_POWERD_CONF/_SUPPLY_DIR/_BACKLIGHT_DIR/_INPUT/_POWEROFF_CMD` (the repo history has an end-to-end test using a FIFO and fake sysfs).
+- Verified on the tablet: short press blanks/unblanks the screen. Power-loss path only verified with fake sysfs. Note: unplugging the PC USB cable
+  from the tablet while it has no other power starts the 5 minute shutdown timer.
+- Not handled: waking from a fully powered-off state when the ignition returns (depends on the PMIC/U-Boot power-on behaviour).
+
 ## 6. Next Steps
 
 1. Real-phone test done (picture, touch with `4x3`, audio over AUX OK). Hotspot mode verified with real phone (video, touch, audio, mobile data all OK). Remaining: long drive test, colour check (BT.601 limited assumed; phone stream may be BT.709).
-3. Re-create `exper-powerd` (screen sleep / power key) - lost with the old card.
+3. ~~Re-create `exper-powerd`~~ done (see 5c).
 4. Clean the debug cmdline baked into the kernel (`ignore_loglevel debug initcall_debug`) and the bring-up probes (see `Exper Easypad 8/HANDOFF.md` section 6.4).
 5. Optional: Cedrus VPU port, or revisit the DE1 frontend (section 3.5) for zero-CPU scaling.

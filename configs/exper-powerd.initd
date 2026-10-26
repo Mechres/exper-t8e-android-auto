@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+description="Exper Easypad 8 power key / external power monitor"
+command="/usr/local/bin/exper-powerd"
+command_background=true
+pidfile="/run/exper-powerd.pid"
+output_log="/var/log/exper-powerd.log"
+error_log="/var/log/exper-powerd.log"
+depend() {
+	need localmount
+}
