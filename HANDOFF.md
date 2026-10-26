@@ -110,18 +110,20 @@ Repository path: `~/Projeler/exper-t8e-android-auto`
 ### 3.4 Touchscreen Input Pipeline
 - **Hardware Controller:** Goodix GT911 managed by the Linux kernel `Goodix-TS` driver on I2C bus 0 address `0x5d`.
 - **Driver Model:** Standard Linux `evdev` event stream read directly from `/dev/input/event0` (`Goodix Capacitive TouchScreen`). Interrupt-driven, zero CPU polling overhead.
-- **Coordinates & Range:**
-  - The kernel driver natively outputs calibrated coordinates matching the 8" panel:
-    $$\text{X}_{\text{screen}} \in [0 \dots 1024]$$
-    $$\text{Y}_{\text{screen}} \in [0 \dots 768]$$
-- **Android Auto MotionEvent Compatibility:**
-  - Protobuf `TouchEvent` specifies:
-    - `touch.set_action_index(0)`
-    - `ev.set_disp_channel(0)`
-    - `InputConfiguration.touchscreen = Some((1024, 768))`
-- **Rate Limiting & Throttling:**
-  - `PRESS` and `RELEASE` are transmitted instantly on `BTN_TOUCH` / `ABS_MT_TRACKING_ID` state transitions.
-  - `DRAG` events are filtered: only transmitted if $\Delta X \ge 4$ or $\Delta Y \ge 4$ pixels AND at least 30 ms has elapsed since the prior event.
+- **Coordinates & Resolution Mapping:**
+  - Physical LCD panel & GT911 hardware report:
+    $$\text{X}_{\text{panel}} \in [0 \dots 1024], \quad \text{Y}_{\text{panel}} \in [0 \dots 768]$$
+  - Android Auto negotiated video surface: $800 \times 480$.
+  - `InputConfiguration.touchscreen` is advertised as `Some((800, 480))` matching the video canvas.
+  - Runtime scaling formula:
+    $$\text{X}_{\text{AA}} = \min\left(799, \left\lfloor\frac{\text{X}_{\text{panel}} \times 800 + 512}{1024}\right\rfloor\right)$$
+    $$\text{Y}_{\text{AA}} = \min\left(479, \left\lfloor\frac{\text{Y}_{\text{panel}} \times 480 + 384}{768}\right\rfloor\right)$$
+- **Android Auto Event Compatibility:**
+  - `TouchAction::PRESS` (0, Android `ACTION_DOWN`) and `TouchAction::RELEASE` (1, Android `ACTION_UP`) with `TouchAction::DRAG` (2, Android `ACTION_MOVE`).
+  - Guaranteed minimum tap duration of 35 ms before transmitting `RELEASE` to ensure Android's gesture detector registers clicks reliably.
+  - `disp_channel` omitted so the event routes to the primary display.
+- **Drag Throttling:**
+  - `DRAG` events filtered to $\Delta X \ge 4$ or $\Delta Y \ge 4$ pixels AND at least 25 ms interval (~40 Hz).
 
 ### 3.5 SMP 4-Core CPU Activation
 - **Kernel State:** Allwinner A31s is now operating with **all 4 Cortex-A7 cores active** (`nproc = 4`, `BogoMIPS = 192.00`).
