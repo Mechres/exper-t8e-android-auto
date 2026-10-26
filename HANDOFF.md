@@ -165,7 +165,7 @@ The original SD card died (unstable reads). New 4 GB SanDisk built with `Exper E
 rootfs ownership + setuid bits). Everything else was installed over the USB network (PC does NAT: `ip_forward` + iptables MASQUERADE,
 tablet needs `ip route replace default via 172.16.42.2 dev usb0; echo nameserver 1.1.1.1 > /etc/resolv.conf` after every boot).
 
-- Kernel `7.2.0-gf36b54d9862f-dirty`, DTB `sun6i-a31s-exper-t8e-drm.dtb` (boot.scr.drm is the active `boot.scr`; `boot.scr.main` = plain DTB).
+- Kernel `7.2.0-gdbd482bca8d3` (clean 10-patch series on branch `t8e-final`, see `telefon-canlandirma/Exper Easypad 8/docs/04-drm-lvds-ekran.md`; boots in 1.8 s to init, DRM ready at 4.5 s), DTB `sun6i-a31s-exper-t8e-drm.dtb` (`boot.scr` loads `zImage-new` + `...-drm-new.dtb`; the previous debug kernel stays on the card as `zImage` / `boot.scr.old`).
   `/boot` is read-only: `mount -o remount,rw /boot` to update.
 - DRM modules load at boot from `/etc/modules-load.d/exper-drm.conf` (frontend, backend, drc, drm). LVDS panel: 1024x768, 24-bit VESA
   mapping, 60 MHz pixel clock, 1350x810 total (matches U-Boot `lcd mode`), PWM backlight PH13 + PA25 enable, panel power PG12.
